@@ -1,26 +1,34 @@
 import os
-import requests
-from telegram import Bot
 import time
+import requests
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-bot = Bot(token=TOKEN)
+def send_message(text: str) -> None:
+    if not TOKEN:
+        print("ERROR: falta TELEGRAM_BOT_TOKEN")
+        return
+    if not CHAT_ID:
+        print("ERROR: falta TELEGRAM_CHAT_ID")
+        return
 
-def enviar_mensaje(texto):
-    bot.send_message(chat_id=CHAT_ID, text=texto)
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    data = {
+        "chat_id": CHAT_ID,
+        "text": text,
+    }
 
-def main():
-    enviar_mensaje("🔥 Bot de apuestas ACTIVO 🔥")
-    
+    response = requests.post(url, data=data, timeout=30)
+    print("Telegram status:", response.status_code)
+    print("Telegram response:", response.text)
+    response.raise_for_status()
+
+def main() -> None:
+    send_message("🔥 Bot funcionando correctamente en Railway 🔥")
     while True:
-        try:
-            enviar_mensaje("Buscando oportunidades...")
-            time.sleep(300)  # cada 5 min
-        except Exception as e:
-            print(e)
-            time.sleep(60)
+        time.sleep(300)
+        send_message("Sigo activo ✅")
 
 if __name__ == "__main__":
     main()
