@@ -1,6 +1,8 @@
 import os
 import time
-import requests
+import json
+import urllib.request
+import urllib.parse
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -14,15 +16,15 @@ def send_message(text: str) -> None:
         return
 
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    data = {
+    data = urllib.parse.urlencode({
         "chat_id": CHAT_ID,
         "text": text,
-    }
+    }).encode("utf-8")
 
-    response = requests.post(url, data=data, timeout=30)
-    print("Telegram status:", response.status_code)
-    print("Telegram response:", response.text)
-    response.raise_for_status()
+    req = urllib.request.Request(url, data=data, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as response:
+        body = response.read().decode("utf-8")
+        print("Telegram response:", body)
 
 def main() -> None:
     send_message("🔥 Bot funcionando correctamente en Railway 🔥")
