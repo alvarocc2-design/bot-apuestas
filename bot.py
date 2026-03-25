@@ -10,6 +10,9 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
 
+BANKROLL = 1000
+MIN_EDGE = 0.08
+
 def send_message(text: str) -> None:
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     data = urllib.parse.urlencode({
@@ -56,31 +59,58 @@ def test_football_api() -> str:
     except Exception as e:
         return f"API-FOOTBALL ERROR ❌ {e}"
 
+def pick_stake(edge: float) -> float:
+    if edge >= 0.15:
+        return 25
+    if edge >= 0.10:
+        return 20
+    return 15
+
+def get_first_laliga_event():
+    url = "https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/events"
+    url += "?" + urllib.parse.urlencode({"apiKey": ODDS_API_KEY})
+
+    with urllib.request.urlopen(url, timeout=30) as response:
+        events = json.loads(response.read().decode("utf-8"))
+
+    if not events:
+        return None
+
+    return events[0]
+
+def get_event_odds(event_id: str):
+    odds_url = f"https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/events/{event_id}/odds"
+    odds_url += "?" + urllib.parse.urlencode({
+        "apiKey": ODDS_API_KEY,
+        "regions": "us,us2",
+        "markets": "player_shots,player_shots_on_target,player_to_receive_card",
+        "oddsFormat": "decimal"
+    })
+
+    with urllib.request.urlopen(odds_url, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+def test_probability_from_odds(price: float) -> float:
+    """
+    Modelo temporal de prueba.
+    Parte de la probabilidad implícita y le suma una pequeña ventaja simulada.
+    Sirve para validar el flujo antes de conectar stats reales.
+    """
+    implied = 1 / price
+    boosted = implied + 0.10
+    return min(boosted, 0.85)
+
 def get_match_odds_message() -> str:
     try:
-        url = "https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/events"
-        url += "?" + urllib.parse.urlencode({"apiKey": ODDS_API_KEY})
-
-        with urllib.request.urlopen(url, timeout=30) as response:
-            events = json.loads(response.read().decode("utf-8"))
-
-        if not events:
+        event = get_first_laliga_event()
+        if not event:
             return "No encontré eventos."
 
-        event_id = events[0].get("id")
-        home = events[0].get("home_team", "Local")
-        away = events[0].get("away_team", "Visitante")
+        event_id = event.get("id")
+        home = event.get("home_team", "Local")
+        away = event.get("away_team", "Visitante")
 
-        odds_url = f"https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/events/{event_id}/odds"
-        odds_url += "?" + urllib.parse.urlencode({
-            "apiKey": ODDS_API_KEY,
-            "regions": "us,us2",
-            "markets": "player_shots,player_shots_on_target,player_to_receive_card",
-            "oddsFormat": "decimal"
-        })
-
-        with urllib.request.urlopen(odds_url, timeout=30) as response:
-            odds_data = json.loads(response.read().decode("utf-8"))
+        odds_data = get_event_odds(event_id)
 
         bookmakers = odds_data.get("bookmakers", [])
         if not bookmakers:
@@ -119,6 +149,72 @@ def get_match_odds_message() -> str:
     except Exception as e:
         return f"Error cuotas ❌ {e}"
 
+def get_value_message() -> str:
+    try:
+        event = get_first_laliga_event()
+        if not event:
+            return "No encontré eventos para analizar."
+
+        event_id = event.get("id")
+        home = event.get("home_team", "Local")
+        away = event.get("away_team", "Visitante")
+
+        odds_data = get_event_odds(event_id)
+        bookmakers = odds_data.get("bookmakers", [])
+
+        if not bookmakers:
+            return f"No encontré cuotas para analizar en {home} vs {away}"
+
+        checked = 0
+
+        for book in bookmakers:
+            book_name = book.get("title", "Bookmaker")
+            for market in book.get("markets", []):
+                market_name = market.get("key")
+
+                # Empezamos por tiros a puerta porque suele ser de lo mejor para props
+                if market_name != "player_shots_on_target":
+                    continue
+
+                for outcome in market.get("outcomes", []):
+                    jugador = outcome.get("description") or outcome.get("name") or "Jugador"
+                    price = outcome.get("price")
+                    line = outcome.get("point", "")
+
+                    if not isinstance(price, (int, float)):
+                        continue
+
+                    checked += 1
+                    implied_prob = 1 / price
+                    model_prob = test_probability_from_odds(price)
+                    edge = (model_prob * price) - 1
+
+                    if edge >= MIN_EDGE:
+                        stake = pick_stake(edge)
+
+                        return (
+                            f"🔥 VALUE DETECTADO\n\n"
+                            f"Partido: {home} vs {away}\n"
+                            f"Casa: {book_name}\n\n"
+                            f"Jugador: {jugador}\n"
+                            f"Mercado: tiros a puerta\n"
+                            f"Línea: {line}\n"
+                            f"Cuota: {price}\n\n"
+                            f"Prob. implícita: {implied_prob:.1%}\n"
+                            f"Prob. estimada: {model_prob:.1%}\n"
+                            f"Edge: {edge:.1%}\n\n"
+                            f"Stake sugerido: {stake}€\n"
+                            f"Bank: {BANKROLL}€\n\n"
+                            f"⚠️ Este cálculo aún es de prueba. El siguiente paso será usar estadísticas reales."
+                        )
+
+        if checked == 0:
+            return "No encontré props de tiros a puerta para analizar."
+        return "He revisado props, pero no encontré value con el filtro actual."
+
+    except Exception as e:
+        return f"Error value ❌ {e}"
+
 def heartbeat():
     while True:
         try:
@@ -145,7 +241,7 @@ def command_loop():
                 text = message.get("text", "")
 
                 if text == "/start":
-                    send_message("🤖 Bot conectado. Comandos: /ping /status /test_odds /test_football /liga /partidos /cuotas")
+                    send_message("🤖 Bot conectado. Comandos: /ping /status /test_odds /test_football /liga /partidos /cuotas /value")
                 elif text == "/ping":
                     send_message("pong 🟢")
                 elif text == "/status":
@@ -180,6 +276,8 @@ def command_loop():
                         send_message(f"Error partidos ❌ {e}")
                 elif text == "/cuotas":
                     send_message(get_match_odds_message())
+                elif text == "/value":
+                    send_message(get_value_message())
 
         except Exception as e:
             print("command_loop error:", e)
