@@ -1,46 +1,60 @@
 import os
 import time
 import threading
+import json
 import urllib.request
 import urllib.parse
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
 
 def send_message(text: str) -> None:
-    if not TOKEN:
-        print("ERROR: falta TELEGRAM_BOT_TOKEN")
-        return
-    if not CHAT_ID:
-        print("ERROR: falta TELEGRAM_CHAT_ID")
-        return
-
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     data = urllib.parse.urlencode({
         "chat_id": CHAT_ID,
         "text": text,
     }).encode("utf-8")
-
     req = urllib.request.Request(url, data=data, method="POST")
     with urllib.request.urlopen(req, timeout=30) as response:
-        body = response.read().decode("utf-8")
-        print("send_message:", body)
+        print(response.read().decode("utf-8"))
 
 def get_updates(offset=None):
     url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
-    params = {}
     if offset is not None:
-        params["offset"] = offset
-    full_url = url
-    if params:
-        full_url += "?" + urllib.parse.urlencode(params)
+        url += "?" + urllib.parse.urlencode({"offset": offset})
+    with urllib.request.urlopen(url, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
 
-    with urllib.request.urlopen(full_url, timeout=30) as response:
-        body = response.read().decode("utf-8")
-        return body
+def test_odds_api() -> str:
+    if not ODDS_API_KEY:
+        return "Falta ODDS_API_KEY"
+    url = "https://api.the-odds-api.com/v4/sports"
+    url += "?" + urllib.parse.urlencode({"apiKey": ODDS_API_KEY})
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        if isinstance(data, list) and len(data) > 0:
+            return f"ODDS API OK ✅ Deportes detectados: {len(data)}"
+        return "ODDS API respondió, pero sin datos."
+    except Exception as e:
+        return f"ODDS API ERROR ❌ {e}"
 
-def send_startup_message():
-    send_message("✅ Bot seguro activo en Railway")
+def test_football_api() -> str:
+    if not API_FOOTBALL_KEY:
+        return "Falta API_FOOTBALL_KEY"
+    url = "https://v3.football.api-sports.io/status"
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("x-apisports-key", API_FOOTBALL_KEY)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        if data.get("response"):
+            return "API-FOOTBALL OK ✅"
+        return "API-FOOTBALL respondió, pero sin datos."
+    except Exception as e:
+        return f"API-FOOTBALL ERROR ❌ {e}"
 
 def heartbeat():
     while True:
@@ -55,12 +69,7 @@ def command_loop():
     offset = None
     while True:
         try:
-            raw = get_updates(offset)
-            print("updates:", raw)
-
-            import json
-            data = json.loads(raw)
-
+            data = get_updates(offset)
             if not data.get("ok"):
                 time.sleep(5)
                 continue
@@ -73,21 +82,24 @@ def command_loop():
                 text = message.get("text", "")
 
                 if text == "/start":
-                    send_message("🤖 Bot conectado. Comandos disponibles: /start, /ping, /status")
+                    send_message("🤖 Bot conectado. Comandos: /ping /status /test_odds /test_football")
                 elif text == "/ping":
                     send_message("pong 🟢")
                 elif text == "/status":
                     send_message("Estado actual: bot estable, Telegram OK, modo seguro activado.")
+                elif text == "/test_odds":
+                    send_message(test_odds_api())
+                elif text == "/test_football":
+                    send_message(test_football_api())
+
         except Exception as e:
             print("command_loop error:", e)
             time.sleep(5)
 
 def main():
-    send_startup_message()
-
+    send_message("✅ Bot seguro activo en Railway")
     t1 = threading.Thread(target=heartbeat, daemon=True)
     t2 = threading.Thread(target=command_loop, daemon=True)
-
     t1.start()
     t2.start()
 
