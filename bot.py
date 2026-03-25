@@ -154,27 +154,18 @@ def resolve_player_id_from_event_player(name: str, event) -> int | None:
     norm_target = normalize_text(name)
     target_parts = norm_target.split()
 
-    print(f"🔍 Buscando jugador: {name}")
-
     fixture = get_matching_fixture_for_event(event)
-
     if not fixture:
-        print("❌ No encontré fixture")
         return None
 
     home_team = fixture.get("teams", {}).get("home", {})
     away_team = fixture.get("teams", {}).get("away", {})
 
-    print(f"🏟 Equipos detectados: {home_team.get('name')} vs {away_team.get('name')}")
-
     squad = []
-
     if home_team.get("id"):
         squad += get_team_squad(home_team["id"])
     if away_team.get("id"):
         squad += get_team_squad(away_team["id"])
-
-    print(f"👥 Jugadores en plantilla: {len(squad)}")
 
     best_id = None
     best_score = 0
@@ -195,13 +186,9 @@ def resolve_player_id_from_event_player(name: str, event) -> int | None:
             best_score = score
             best_id = p.get("id")
 
-    print(f"🏆 Mejor score: {best_score}")
-
     if best_score >= 25:
-        print(f"✅ Jugador encontrado con ID: {best_id}")
         return best_id
 
-    print("❌ No se encontró jugador en plantilla")
     return None
 
 def get_player_stats(player_name):
@@ -311,6 +298,36 @@ def get_first_player_from_props():
 
     return None
 
+def get_debug_squad_message():
+    try:
+        event = get_first_laliga_event()
+        if not event:
+            return "No encontré evento"
+
+        fixture = get_matching_fixture_for_event(event)
+        if not fixture:
+            return "No encontré fixture para ese partido"
+
+        home_team = fixture.get("teams", {}).get("home", {})
+        away_team = fixture.get("teams", {}).get("away", {})
+
+        home_squad = get_team_squad(home_team.get("id")) if home_team.get("id") else []
+        away_squad = get_team_squad(away_team.get("id")) if away_team.get("id") else []
+
+        mensaje = f"🔎 DEBUG PLANTILLAS\n\n"
+        mensaje += f"{home_team.get('name', 'Local')}:\n"
+        for p in home_squad[:10]:
+            mensaje += f"- {p.get('name', 'Sin nombre')}\n"
+
+        mensaje += f"\n{away_team.get('name', 'Visitante')}:\n"
+        for p in away_squad[:10]:
+            mensaje += f"- {p.get('name', 'Sin nombre')}\n"
+
+        return mensaje
+
+    except Exception as e:
+        return f"Error debug_squad ❌ {e}"
+
 def test_probability_from_odds(price: float) -> float:
     implied = 1 / price
     boosted = implied + 0.10
@@ -418,7 +435,7 @@ def command_loop():
                 text = message.get("text", "")
 
                 if text == "/start":
-                    send_message("🤖 Bot conectado. Comandos: /ping /status /test_odds /test_football /liga /partidos /cuotas /value /stats")
+                    send_message("🤖 Bot conectado. Comandos: /ping /status /test_odds /test_football /liga /partidos /cuotas /value /stats /debug_squad")
                 elif text == "/ping":
                     send_message("pong 🟢")
                 elif text == "/status":
@@ -456,6 +473,8 @@ def command_loop():
                     send_message(get_value_message())
                 elif text == "/stats":
                     send_message(stats_command())
+                elif text == "/debug_squad":
+                    send_message(get_debug_squad_message())
 
         except Exception as e:
             print("command_loop error:", e)
