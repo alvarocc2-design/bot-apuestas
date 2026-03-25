@@ -4,6 +4,7 @@ import threading
 import json
 import urllib.request
 import urllib.parse
+import unicodedata
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -27,30 +28,79 @@ def get_updates(offset=None):
     with urllib.request.urlopen(url, timeout=30) as response:
         return json.loads(response.read().decode("utf-8"))
 
-# 🔥 FIX IMPORTANTE (búsqueda de jugador mejorada)
+def normalize_text(text: str) -> str:
+    text = text.lower().strip()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    return " ".join(text.split())
+
+def search_players_api(query: str):
+    url = "https://v3.football.api-sports.io/players"
+    url += "?" + urllib.parse.urlencode({"search": query})
+
+    req = urllib.request.Request(url)
+    req.add_header("x-apisports-key", API_FOOTBALL_KEY)
+
+    with urllib.request.urlopen(req, timeout=30) as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    return data.get("response", [])
+
 def get_player_id(name):
-    posibles_busquedas = [
-        name,
-        " ".join(name.split()[:2]),
-        name.split()[-1]
-    ]
+    original = normalize_text(name)
+    parts = original.split()
 
-    for busqueda in posibles_busquedas:
+    queries = []
+    queries.append(original)
+
+    if len(parts) >= 2:
+        queries.append(" ".join(parts[:2]))
+        queries.append(" ".join(parts[-2:]))
+        queries.append(parts[0])
+        queries.append(parts[-1])
+    elif len(parts) == 1:
+        queries.append(parts[0])
+
+    # quitar duplicados manteniendo orden
+    seen = set()
+    clean_queries = []
+    for q in queries:
+        if q and q not in seen:
+            clean_queries.append(q)
+            seen.add(q)
+
+    best_match = None
+    best_score = -1
+
+    for query in clean_queries:
         try:
-            url = "https://v3.football.api-sports.io/players"
-            url += "?" + urllib.parse.urlencode({"search": busqueda})
+            results = search_players_api(query)
 
-            req = urllib.request.Request(url)
-            req.add_header("x-apisports-key", API_FOOTBALL_KEY)
+            for item in results:
+                player = item.get("player", {})
+                candidate_name = normalize_text(player.get("name", ""))
 
-            with urllib.request.urlopen(req, timeout=30) as response:
-                data = json.loads(response.read().decode("utf-8"))
+                score = 0
 
-            if data["response"]:
-                return data["response"][0]["player"]["id"]
+                if candidate_name == original:
+                    score = 100
+                elif original in candidate_name:
+                    score = 90
+                elif candidate_name in original:
+                    score = 80
+                else:
+                    shared = sum(1 for p in parts if p in candidate_name.split())
+                    score = shared * 20
 
-        except:
+                if score > best_score:
+                    best_score = score
+                    best_match = player
+
+        except Exception:
             continue
+
+    if best_match and best_score >= 20:
+        return best_match.get("id")
 
     return None
 
@@ -61,7 +111,10 @@ def get_player_stats(player_name):
 
     try:
         url = "https://v3.football.api-sports.io/players"
-        url += "?" + urllib.parse.urlencode({"id": player_id, "season": 2024})
+        url += "?" + urllib.parse.urlencode({
+            "id": player_id,
+            "season": 2024
+        })
 
         req = urllib.request.Request(url)
         req.add_header("x-apisports-key", API_FOOTBALL_KEY)
@@ -69,154 +122,283 @@ def get_player_stats(player_name):
         with urllib.request.urlopen(req, timeout=30) as response:
             data = json.loads(response.read().decode("utf-8"))
 
+        if not data.get("response"):
+            return f"No encontré estadísticas para {player_name}"
+
         stats = data["response"][0]["statistics"][0]
 
-        tiros = stats["shots"]["total"] or 0
-        tiros_puerta = stats["shots"]["on"] or 0
-        partidos = stats["games"]["appearences"] or 1
+        tiros = stats.get("shots", {}).get("total") or 0
+        tiros_puerta = stats.get("shots", {}).get("on") or 0
+        partidos = stats.get("games", {}).get("appearences") or 1
 
-        media = round(tiros_puerta / partidos, 2)
+        media_tiros = round(tiros / partidos, 2) if partidos else 0
+        media_tiros_puerta = round(tiros_puerta / partidos, 2) if partidos else 0
 
-        return f"""📊 Stats {player_name}
-
-Partidos: {partidos}
-Tiros totales: {tiros}
-Tiros a puerta: {tiros_puerta}
-Media tiros a puerta: {media}
-"""
+        return (
+            f"📊 Stats {player_name}\n\n"
+            f"Partidos: {partidos}\n"
+            f"Tiros totales: {tiros}\n"
+            f"Tiros a puerta: {tiros_puerta}\n"
+            f"Media tiros: {media_tiros}\n"
+            f"Media tiros a puerta: {media_tiros_puerta}"
+        )
 
     except Exception as e:
         return f"Error stats ❌ {e}"
 
+def get_first_laliga_event():
+    url = "https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/events"
+    url += "?" + urllib.parse.urlencode({"apiKey": ODDS_API_KEY})
+
+    with urllib.request.urlopen(url, timeout=30) as response:
+        events = json.loads(response.read().decode("utf-8"))
+
+    if not events:
+        return None
+
+    return events[0]
+
+def get_event_odds(event_id: str):
+    odds_url = f"https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/events/{event_id}/odds"
+    odds_url += "?" + urllib.parse.urlencode({
+        "apiKey": ODDS_API_KEY,
+        "regions": "us,us2",
+        "markets": "player_shots,player_shots_on_target,player_to_receive_card",
+        "oddsFormat": "decimal"
+    })
+
+    with urllib.request.urlopen(odds_url, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
 def get_match_odds_message() -> str:
     try:
-        url = "https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/events"
-        url += "?" + urllib.parse.urlencode({"apiKey": ODDS_API_KEY})
-
-        with urllib.request.urlopen(url, timeout=30) as response:
-            events = json.loads(response.read().decode("utf-8"))
-
-        if not events:
+        event = get_first_laliga_event()
+        if not event:
             return "No encontré eventos."
 
-        event_id = events[0]["id"]
-        home = events[0]["home_team"]
-        away = events[0]["away_team"]
+        event_id = event.get("id")
+        home = event.get("home_team", "Local")
+        away = event.get("away_team", "Visitante")
 
-        odds_url = f"https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/events/{event_id}/odds"
-        odds_url += "?" + urllib.parse.urlencode({
-            "apiKey": ODDS_API_KEY,
-            "regions": "us,us2",
-            "markets": "player_shots_on_target",
-            "oddsFormat": "decimal"
-        })
-
-        with urllib.request.urlopen(odds_url, timeout=30) as response:
-            odds_data = json.loads(response.read().decode("utf-8"))
+        odds_data = get_event_odds(event_id)
 
         bookmakers = odds_data.get("bookmakers", [])
         if not bookmakers:
-            return "No hay cuotas disponibles."
+            return f"No encontré cuotas para {home} vs {away}"
 
         mensaje = f"💰 Cuotas para:\n{home} vs {away}\n\n"
 
+        found_any_player_market = False
+
         for book in bookmakers[:2]:
-            mensaje += f"🏪 {book['title']}\n"
+            mensaje += f"🏪 {book.get('title', 'Bookmaker')}\n"
 
-            for market in book["markets"]:
-                for outcome in market["outcomes"][:3]:
-                    jugador = outcome["description"]
-                    linea = outcome["point"]
-                    cuota = outcome["price"]
+            markets = book.get("markets", [])
+            for market in markets:
+                market_name = market.get("key")
 
-                    mensaje += f"{jugador} → {cuota}\n"
+                if market_name in ["player_shots", "player_shots_on_target", "player_to_receive_card"]:
+                    outcomes = market.get("outcomes", [])
+                    if outcomes:
+                        found_any_player_market = True
+
+                    for outcome in outcomes[:3]:
+                        jugador = outcome.get("description") or outcome.get("name") or "Jugador"
+                        cuota = outcome.get("price", "")
+                        linea = outcome.get("point", "")
+
+                        mensaje += f"{jugador} | {market_name} {linea} → {cuota}\n"
 
             mensaje += "\n"
+
+        if not found_any_player_market:
+            return f"No encontré mercados de jugador para {home} vs {away}"
 
         return mensaje
 
     except Exception as e:
         return f"Error cuotas ❌ {e}"
 
-def detect_value():
+def get_first_player_from_props():
+    event = get_first_laliga_event()
+    if not event:
+        return None
+
+    odds_data = get_event_odds(event["id"])
+
+    for book in odds_data.get("bookmakers", []):
+        for market in book.get("markets", []):
+            if market.get("key") == "player_shots_on_target":
+                outcomes = market.get("outcomes", [])
+                if outcomes:
+                    return outcomes[0].get("description")
+
+    return None
+
+def test_probability_from_odds(price: float) -> float:
+    implied = 1 / price
+    boosted = implied + 0.10
+    return min(boosted, 0.85)
+
+def pick_stake(edge: float) -> float:
+    if edge >= 0.15:
+        return 25
+    if edge >= 0.10:
+        return 20
+    return 15
+
+def get_value_message() -> str:
     try:
-        url = "https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/events"
-        url += "?" + urllib.parse.urlencode({"apiKey": ODDS_API_KEY})
+        event = get_first_laliga_event()
+        if not event:
+            return "No encontré eventos para analizar."
 
-        with urllib.request.urlopen(url, timeout=30) as response:
-            events = json.loads(response.read().decode("utf-8"))
+        event_id = event.get("id")
+        home = event.get("home_team", "Local")
+        away = event.get("away_team", "Visitante")
 
-        event = events[0]
-        event_id = event["id"]
-        home = event["home_team"]
-        away = event["away_team"]
+        odds_data = get_event_odds(event_id)
+        bookmakers = odds_data.get("bookmakers", [])
 
-        odds_url = f"https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/events/{event_id}/odds"
-        odds_url += "?" + urllib.parse.urlencode({
-            "apiKey": ODDS_API_KEY,
-            "regions": "us,us2",
-            "markets": "player_shots_on_target",
-            "oddsFormat": "decimal"
-        })
+        if not bookmakers:
+            return f"No encontré cuotas para analizar en {home} vs {away}"
 
-        with urllib.request.urlopen(odds_url, timeout=30) as response:
-            odds_data = json.loads(response.read().decode("utf-8"))
+        checked = 0
 
-        book = odds_data["bookmakers"][0]
-        market = book["markets"][0]
-        outcome = market["outcomes"][0]
+        for book in bookmakers:
+            book_name = book.get("title", "Bookmaker")
+            for market in book.get("markets", []):
+                market_name = market.get("key")
 
-        jugador = outcome["description"]
-        cuota = outcome["price"]
+                if market_name != "player_shots_on_target":
+                    continue
 
-        prob_implicita = round(1 / cuota * 100, 1)
-        prob_estimada = prob_implicita + 10
+                for outcome in market.get("outcomes", []):
+                    jugador = outcome.get("description") or outcome.get("name") or "Jugador"
+                    price = outcome.get("price")
+                    line = outcome.get("point", "")
 
-        return f"""🔥 VALUE DETECTADO
+                    if not isinstance(price, (int, float)):
+                        continue
 
-{home} vs {away}
+                    checked += 1
+                    implied_prob = 1 / price
+                    model_prob = test_probability_from_odds(price)
+                    edge = (model_prob * price) - 1
 
-Jugador: {jugador}
-Cuota: {cuota}
+                    if edge >= 0.08:
+                        stake = pick_stake(edge)
 
-Prob implícita: {prob_implicita}%
-Prob estimada: {prob_estimada}%
-"""
+                        return (
+                            f"🔥 VALUE DETECTADO\n\n"
+                            f"Partido: {home} vs {away}\n"
+                            f"Casa: {book_name}\n\n"
+                            f"Jugador: {jugador}\n"
+                            f"Mercado: tiros a puerta\n"
+                            f"Línea: {line}\n"
+                            f"Cuota: {price}\n\n"
+                            f"Prob. implícita: {implied_prob:.1%}\n"
+                            f"Prob. estimada: {model_prob:.1%}\n"
+                            f"Edge: {edge:.1%}\n\n"
+                            f"Stake sugerido: {stake}€\n"
+                            f"Bank: 1000€\n\n"
+                            f"⚠️ Este cálculo aún es de prueba. El siguiente paso será usar estadísticas reales."
+                        )
+
+        if checked == 0:
+            return "No encontré props de tiros a puerta para analizar."
+        return "He revisado props, pero no encontré value con el filtro actual."
 
     except Exception as e:
         return f"Error value ❌ {e}"
+
+def stats_command():
+    try:
+        jugador = get_first_player_from_props()
+        if not jugador:
+            return "No encontré jugador"
+
+        return get_player_stats(jugador)
+
+    except Exception as e:
+        return f"Error stats ❌ {e}"
+
+def heartbeat():
+    while True:
+        try:
+            time.sleep(300)
+            send_message("Sigo activo ✅")
+        except Exception as e:
+            print("heartbeat error:", e)
+            time.sleep(30)
 
 def command_loop():
     offset = None
     while True:
         try:
             data = get_updates(offset)
+            if not data.get("ok"):
+                time.sleep(5)
+                continue
 
             for item in data.get("result", []):
-                offset = item["update_id"] + 1
-                text = item["message"].get("text", "")
+                update_id = item["update_id"]
+                offset = update_id + 1
+
+                message = item.get("message", {})
+                text = message.get("text", "")
 
                 if text == "/start":
-                    send_message("🤖 Bot PRO activo\nComandos: /cuotas /value /stats")
+                    send_message("🤖 Bot conectado. Comandos: /ping /status /test_odds /test_football /liga /partidos /cuotas /value /stats")
+                elif text == "/ping":
+                    send_message("pong 🟢")
+                elif text == "/status":
+                    send_message("Estado actual: bot estable, Telegram OK, modo seguro activado.")
+                elif text == "/test_odds":
+                    send_message(test_odds_api())
+                elif text == "/test_football":
+                    send_message(test_football_api())
+                elif text == "/liga":
+                    send_message("Comando /liga detectado ✅")
+                elif text == "/partidos":
+                    try:
+                        url = "https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/events"
+                        url += "?" + urllib.parse.urlencode({"apiKey": ODDS_API_KEY})
 
+                        with urllib.request.urlopen(url, timeout=30) as response:
+                            data_events = json.loads(response.read().decode("utf-8"))
+
+                        if not data_events:
+                            send_message("No hay partidos disponibles")
+                            continue
+
+                        mensaje = "📊 Próximos partidos:\n\n"
+                        for partido in data_events[:5]:
+                            home = partido.get("home_team", "Local")
+                            away = partido.get("away_team", "Visitante")
+                            mensaje += f"{home} vs {away}\n"
+
+                        send_message(mensaje)
+
+                    except Exception as e:
+                        send_message(f"Error partidos ❌ {e}")
                 elif text == "/cuotas":
                     send_message(get_match_odds_message())
-
                 elif text == "/value":
-                    send_message(detect_value())
-
+                    send_message(get_value_message())
                 elif text == "/stats":
-                    send_message(get_player_stats("Aleix Febas"))
+                    send_message(stats_command())
 
         except Exception as e:
-            print(e)
+            print("command_loop error:", e)
             time.sleep(5)
 
 def main():
     send_message("🔥 Bot PRO iniciando 🔥")
-
-    t = threading.Thread(target=command_loop)
-    t.start()
+    t1 = threading.Thread(target=heartbeat, daemon=True)
+    t2 = threading.Thread(target=command_loop, daemon=True)
+    t1.start()
+    t2.start()
 
     while True:
         time.sleep(60)
