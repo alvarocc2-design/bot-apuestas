@@ -18,7 +18,6 @@ MIN_EDGE = 0.08
 CURRENT_YEAR = datetime.now(timezone.utc).year
 SEASONS_TO_TRY = [CURRENT_YEAR, CURRENT_YEAR - 1]
 
-# [No verificado] Ajusta sport_key / league_id si tu proveedor usa otro valor
 LEAGUES = {
     "laliga": {
         "name": "LaLiga EA Sports",
@@ -175,13 +174,21 @@ def get_first_event():
     return events[0]
 
 
+def get_all_events(limit=5):
+    events = odds_get(
+        f"/sports/{current_sport_key()}/events",
+        {"apiKey": ODDS_API_KEY}
+    )
+    return events[:limit] if events else []
+
+
 def get_event_odds(event_id: str):
     return odds_get(
         f"/sports/{current_sport_key()}/events/{event_id}/odds",
         {
             "apiKey": ODDS_API_KEY,
             "regions": "us,us2",
-            "markets": "player_shots,player_shots_on_target,player_to_receive_card",
+            "markets": "alternate_totals_corners,alternate_spreads_corners",
             "oddsFormat": "decimal"
         }
     )
@@ -248,117 +255,97 @@ def get_matching_fixture_for_event(event):
         return None
 
 
-def get_team_squad(team_id: int):
-    try:
-        data = football_get("/players/squads", {"team": team_id})
-        response = data.get("response", [])
-        if not response:
-            return []
-        return response[0].get("players", [])
-    except Exception as e:
-        print("get_team_squad error:", e)
-        return []
+def extract_corner_kicks_from_statistics(stats_response, team_name):
+    """
+    stats_response viene de /fixtures/statistics?fixture=ID
+    """
+    norm_team = normalize_text(team_name)
+
+    for team_block in stats_response.get("response", []):
+        block_team_name = team_block.get("team", {}).get("name", "")
+        if not team_names_match(norm_team, block_team_name):
+            continue
+
+        for stat in team_block.get("statistics", []):
+            stat_type = stat.get("type", "")
+            stat_value = stat.get("value", 0)
+
+            if normalize_text(stat_type) in ["corner kicks", "corners", "corner kicks "]:
+                try:
+                    return int(stat_value or 0)
+                except Exception:
+                    return 0
+    return None
 
 
-def resolve_player_id_from_event_player(name: str, event) -> int | None:
-    norm_target = normalize_text(name)
-    target_parts = norm_target.split()
+def get_fixture_statistics(fixture_id: int):
+    return football_get("/fixtures/statistics", {"fixture": fixture_id})
 
+
+def get_recent_team_fixtures(team_id: int, limit: int = 5):
+    data = football_get("/fixtures", {
+        "team": team_id,
+        "league": current_football_league_id(),
+        "last": limit
+    })
+    return data.get("response", [])
+
+
+def get_team_corner_series(team_id: int, team_name: str, limit: int = 5):
+    fixtures = get_recent_team_fixtures(team_id, limit=limit)
+    values = []
+
+    for fx in fixtures:
+        fixture_id = fx.get("fixture", {}).get("id")
+        if not fixture_id:
+            continue
+
+        try:
+            stats = get_fixture_statistics(fixture_id)
+            corners = extract_corner_kicks_from_statistics(stats, team_name)
+            if corners is not None:
+                values.append(corners)
+        except Exception:
+            continue
+
+    return values
+
+
+def get_fixture_team_ids(event):
     fixture = get_matching_fixture_for_event(event)
     if not fixture:
         return None
 
-    home_team = fixture.get("teams", {}).get("home", {})
-    away_team = fixture.get("teams", {}).get("away", {})
+    home = fixture.get("teams", {}).get("home", {})
+    away = fixture.get("teams", {}).get("away", {})
 
-    squad = []
-    if home_team.get("id"):
-        squad += get_team_squad(home_team["id"])
-    if away_team.get("id"):
-        squad += get_team_squad(away_team["id"])
-
-    best_id = None
-    best_score = 0
-
-    for p in squad:
-        player_name = normalize_text(p.get("name", ""))
-        score = 0
-
-        if player_name == norm_target:
-            score = 100
-        elif norm_target in player_name:
-            score = 90
-        else:
-            shared = sum(1 for part in target_parts if part in player_name.split())
-            score = shared * 25
-
-        if score > best_score:
-            best_score = score
-            best_id = p.get("id")
-
-    if best_score >= 25:
-        return best_id
-
-    return None
+    return {
+        "home_id": home.get("id"),
+        "away_id": away.get("id"),
+        "home_name": home.get("name", event.get("home_team", "Local")),
+        "away_name": away.get("name", event.get("away_team", "Visitante")),
+        "fixture_id": fixture.get("fixture", {}).get("id")
+    }
 
 
-def get_player_stats(player_name):
-    event = get_first_event()
-    if not event:
-        return "No encontré evento para resolver el jugador"
-
-    player_id = resolve_player_id_from_event_player(player_name, event)
-    if not player_id:
-        return f"No encontré ID para {player_name}"
-
+def get_corners_partidos_message():
     try:
-        found = None
+        events = get_all_events(limit=5)
+        if not events:
+            return f"No hay partidos disponibles en {current_league_name()}"
 
-        for season in SEASONS_TO_TRY:
-            data = football_get("/players", {
-                "id": player_id,
-                "season": season
-            })
+        mensaje = f"📊 Próximos partidos ({current_league_name()}):\n\n"
+        for partido in events:
+            home = partido.get("home_team", "Local")
+            away = partido.get("away_team", "Visitante")
+            mensaje += f"{home} vs {away}\n"
 
-            if data.get("response"):
-                found = data
-                break
-
-        if not found or not found.get("response"):
-            return f"No encontré estadísticas para {player_name}"
-
-        stats_blocks = found["response"][0].get("statistics", [])
-        if not stats_blocks:
-            return f"No encontré estadísticas para {player_name}"
-
-        best_block = max(
-            stats_blocks,
-            key=lambda s: (s.get("games", {}).get("appearences") or 0)
-        )
-
-        tiros = best_block.get("shots", {}).get("total") or 0
-        tiros_puerta = best_block.get("shots", {}).get("on") or 0
-        partidos = best_block.get("games", {}).get("appearences") or 1
-        team_name = best_block.get("team", {}).get("name", "Equipo")
-
-        media_tiros = round(tiros / partidos, 2) if partidos else 0
-        media_tiros_puerta = round(tiros_puerta / partidos, 2) if partidos else 0
-
-        return (
-            f"📊 Stats {player_name}\n\n"
-            f"Equipo: {team_name}\n"
-            f"Partidos: {partidos}\n"
-            f"Tiros totales: {tiros}\n"
-            f"Tiros a puerta: {tiros_puerta}\n"
-            f"Media tiros: {media_tiros}\n"
-            f"Media tiros a puerta: {media_tiros_puerta}"
-        )
-
+        return mensaje
     except Exception as e:
-        return f"Error stats ❌ {e}"
+        return f"Error corners_partidos ❌ {e}"
 
 
-def get_match_odds_message() -> str:
+def get_corners_odds_message():
     try:
         event = get_first_event()
         if not event:
@@ -372,9 +359,9 @@ def get_match_odds_message() -> str:
         bookmakers = odds_data.get("bookmakers", [])
 
         if not bookmakers:
-            return f"No encontré cuotas para {home} vs {away}"
+            return f"No encontré cuotas de córners para {home} vs {away}"
 
-        mensaje = f"💰 Cuotas para:\n{home} vs {away}\nLiga: {current_league_name()}\n\n"
+        mensaje = f"🚩 Cuotas de córners:\n{home} vs {away}\nLiga: {current_league_name()}\n\n"
         found_any = False
 
         for book in bookmakers[:2]:
@@ -382,41 +369,150 @@ def get_match_odds_message() -> str:
 
             for market in book.get("markets", []):
                 market_name = market.get("key")
-                if market_name in ["player_shots", "player_shots_on_target", "player_to_receive_card"]:
+                if market_name in ["alternate_totals_corners", "alternate_spreads_corners"]:
                     outcomes = market.get("outcomes", [])
                     if outcomes:
                         found_any = True
-                    for outcome in outcomes[:3]:
-                        jugador = outcome.get("description") or outcome.get("name") or "Jugador"
-                        linea = outcome.get("point", "")
-                        cuota = outcome.get("price", "")
-                        mensaje += f"{jugador} | {market_name} {linea} → {cuota}\n"
+
+                    for outcome in outcomes[:6]:
+                        name = outcome.get("name", "")
+                        point = outcome.get("point", "")
+                        price = outcome.get("price", "")
+                        desc = outcome.get("description", "")
+
+                        extra = f" ({desc})" if desc else ""
+                        mensaje += f"{market_name} | {name} {point}{extra} → {price}\n"
+
             mensaje += "\n"
 
         if not found_any:
-            return f"No encontré mercados de jugador para {home} vs {away}"
+            return f"No encontré mercados de córners para {home} vs {away}"
 
         return mensaje
 
     except Exception as e:
-        return f"Error cuotas ❌ {e}"
+        return f"Error corners_cuotas ❌ {e}"
 
 
-def get_first_player_from_props():
-    event = get_first_event()
-    if not event:
-        return None
+def get_corners_stats_message():
+    try:
+        event = get_first_event()
+        if not event:
+            return "No encontré evento"
 
-    odds_data = get_event_odds(event["id"])
+        ids = get_fixture_team_ids(event)
+        if not ids:
+            return "No encontré fixture para ese partido"
 
-    for book in odds_data.get("bookmakers", []):
-        for market in book.get("markets", []):
-            if market.get("key") == "player_shots_on_target":
-                outcomes = market.get("outcomes", [])
-                if outcomes:
-                    return outcomes[0].get("description")
+        home_series = get_team_corner_series(ids["home_id"], ids["home_name"], limit=5) if ids["home_id"] else []
+        away_series = get_team_corner_series(ids["away_id"], ids["away_name"], limit=5) if ids["away_id"] else []
 
-    return None
+        home_avg = round(sum(home_series) / len(home_series), 2) if home_series else 0
+        away_avg = round(sum(away_series) / len(away_series), 2) if away_series else 0
+        total_avg = round(home_avg + away_avg, 2)
+
+        return (
+            f"📊 Stats córners ({current_league_name()})\n\n"
+            f"{ids['home_name']}: {home_series if home_series else 'sin datos'}\n"
+            f"Media: {home_avg}\n\n"
+            f"{ids['away_name']}: {away_series if away_series else 'sin datos'}\n"
+            f"Media: {away_avg}\n\n"
+            f"Media total estimada: {total_avg}"
+        )
+
+    except Exception as e:
+        return f"Error corners_stats ❌ {e}"
+
+
+def get_corners_value_message():
+    try:
+        event = get_first_event()
+        if not event:
+            return "No encontré eventos para analizar."
+
+        ids = get_fixture_team_ids(event)
+        if not ids:
+            return "No encontré fixture para ese partido"
+
+        home_series = get_team_corner_series(ids["home_id"], ids["home_name"], limit=5) if ids["home_id"] else []
+        away_series = get_team_corner_series(ids["away_id"], ids["away_name"], limit=5) if ids["away_id"] else []
+
+        if not home_series or not away_series:
+            return "No hay suficientes stats de córners para analizar."
+
+        total_estimated = round(
+            (sum(home_series) / len(home_series)) + (sum(away_series) / len(away_series)),
+            2
+        )
+
+        odds_data = get_event_odds(event.get("id"))
+        bookmakers = odds_data.get("bookmakers", [])
+
+        if not bookmakers:
+            return f"No encontré cuotas de córners para {event.get('home_team')} vs {event.get('away_team')}"
+
+        checked = 0
+
+        for book in bookmakers:
+            book_name = book.get("title", "Bookmaker")
+
+            for market in book.get("markets", []):
+                if market.get("key") != "alternate_totals_corners":
+                    continue
+
+                for outcome in market.get("outcomes", []):
+                    name = outcome.get("name", "")
+                    point = outcome.get("point")
+                    price = outcome.get("price")
+
+                    if not isinstance(price, (int, float)) or point is None:
+                        continue
+
+                    checked += 1
+
+                    try:
+                        line = float(point)
+                    except Exception:
+                        continue
+
+                    # modelo simple inicial: comparar media total estimada contra la línea
+                    if name.lower() == "over":
+                        if total_estimated <= line:
+                            continue
+
+                        margin = total_estimated - line
+                        implied_prob = 1 / price
+                        model_prob = min(0.50 + (margin * 0.08), 0.85)
+                        edge = (model_prob * price) - 1
+
+                        if edge >= MIN_EDGE:
+                            stake = pick_stake(edge)
+
+                            return (
+                                f"🚩 VALUE CÓRNERS DETECTADO\n\n"
+                                f"Liga: {current_league_name()}\n"
+                                f"Partido: {event.get('home_team')} vs {event.get('away_team')}\n"
+                                f"Casa: {book_name}\n\n"
+                                f"Mercado: Over córners totales\n"
+                                f"Línea: {line}\n"
+                                f"Cuota: {price}\n\n"
+                                f"Media estimada local: {round(sum(home_series)/len(home_series),2)}\n"
+                                f"Media estimada visitante: {round(sum(away_series)/len(away_series),2)}\n"
+                                f"Media total estimada: {total_estimated}\n\n"
+                                f"Prob. implícita: {implied_prob:.1%}\n"
+                                f"Prob. estimada: {model_prob:.1%}\n"
+                                f"Edge: {edge:.1%}\n\n"
+                                f"Stake sugerido: {stake}€\n"
+                                f"Bank: {BANKROLL}€\n\n"
+                                f"⚠️ Modelo inicial de córners. Se puede afinar después."
+                            )
+
+        if checked == 0:
+            return "No encontré líneas de córners totales para analizar."
+        return "He revisado córners, pero no encontré value con el filtro actual."
+
+    except Exception as e:
+        return f"Error corners_value ❌ {e}"
 
 
 def get_debug_fixture_message():
@@ -458,122 +554,6 @@ def get_debug_fixture_message():
         return f"Error debug_fixture ❌ {e}"
 
 
-def get_debug_squad_message():
-    try:
-        event = get_first_event()
-        if not event:
-            return "No encontré evento"
-
-        fixture = get_matching_fixture_for_event(event)
-        if not fixture:
-            return "No encontré fixture para ese partido"
-
-        home_team = fixture.get("teams", {}).get("home", {})
-        away_team = fixture.get("teams", {}).get("away", {})
-
-        home_squad = get_team_squad(home_team.get("id")) if home_team.get("id") else []
-        away_squad = get_team_squad(away_team.get("id")) if away_team.get("id") else []
-
-        mensaje = f"🔎 DEBUG PLANTILLAS\n\n"
-        mensaje += f"{home_team.get('name', 'Local')}:\n"
-        for p in home_squad[:10]:
-            mensaje += f"- {p.get('name', 'Sin nombre')}\n"
-
-        mensaje += f"\n{away_team.get('name', 'Visitante')}:\n"
-        for p in away_squad[:10]:
-            mensaje += f"- {p.get('name', 'Sin nombre')}\n"
-
-        return mensaje
-
-    except Exception as e:
-        return f"Error debug_squad ❌ {e}"
-
-
-def test_probability_from_odds(price: float) -> float:
-    implied = 1 / price
-    boosted = implied + 0.10
-    return min(boosted, 0.85)
-
-
-def get_value_message() -> str:
-    try:
-        event = get_first_event()
-        if not event:
-            return "No encontré eventos para analizar."
-
-        event_id = event.get("id")
-        home = event.get("home_team", "Local")
-        away = event.get("away_team", "Visitante")
-
-        odds_data = get_event_odds(event_id)
-        bookmakers = odds_data.get("bookmakers", [])
-
-        if not bookmakers:
-            return f"No encontré cuotas para analizar en {home} vs {away}"
-
-        checked = 0
-
-        for book in bookmakers:
-            book_name = book.get("title", "Bookmaker")
-            for market in book.get("markets", []):
-                market_name = market.get("key")
-
-                if market_name != "player_shots_on_target":
-                    continue
-
-                for outcome in market.get("outcomes", []):
-                    jugador = outcome.get("description") or outcome.get("name") or "Jugador"
-                    price = outcome.get("price")
-                    line = outcome.get("point", "")
-
-                    if not isinstance(price, (int, float)):
-                        continue
-
-                    checked += 1
-                    implied_prob = 1 / price
-                    model_prob = test_probability_from_odds(price)
-                    edge = (model_prob * price) - 1
-
-                    if edge >= MIN_EDGE:
-                        stake = pick_stake(edge)
-
-                        return (
-                            f"🔥 VALUE DETECTADO\n\n"
-                            f"Liga: {current_league_name()}\n"
-                            f"Partido: {home} vs {away}\n"
-                            f"Casa: {book_name}\n\n"
-                            f"Jugador: {jugador}\n"
-                            f"Mercado: tiros a puerta\n"
-                            f"Línea: {line}\n"
-                            f"Cuota: {price}\n\n"
-                            f"Prob. implícita: {implied_prob:.1%}\n"
-                            f"Prob. estimada: {model_prob:.1%}\n"
-                            f"Edge: {edge:.1%}\n\n"
-                            f"Stake sugerido: {stake}€\n"
-                            f"Bank: {BANKROLL}€\n\n"
-                            f"⚠️ Este cálculo aún es de prueba. El siguiente paso será usar estadísticas reales."
-                        )
-
-        if checked == 0:
-            return "No encontré props de tiros a puerta para analizar."
-        return "He revisado props, pero no encontré value con el filtro actual."
-
-    except Exception as e:
-        return f"Error value ❌ {e}"
-
-
-def stats_command():
-    try:
-        jugador = get_first_player_from_props()
-        if not jugador:
-            return "No encontré jugador"
-
-        return get_player_stats(jugador)
-
-    except Exception as e:
-        return f"Error stats ❌ {e}"
-
-
 def heartbeat():
     while True:
         try:
@@ -604,7 +584,7 @@ def command_loop():
 
                 if text == "/start":
                     send_message(
-                        "🤖 Bot conectado.\n"
+                        "🤖 Bot córners conectado.\n"
                         "Comandos:\n"
                         "/ligas\n"
                         "/setliga <clave>\n"
@@ -612,12 +592,11 @@ def command_loop():
                         "/status\n"
                         "/test_odds\n"
                         "/test_football\n"
-                        "/partidos\n"
-                        "/cuotas\n"
-                        "/value\n"
-                        "/stats\n"
-                        "/debug_fixture\n"
-                        "/debug_squad"
+                        "/corners_partidos\n"
+                        "/corners_cuotas\n"
+                        "/corners_stats\n"
+                        "/corners_value\n"
+                        "/debug_fixture"
                     )
                 elif text == "/ping":
                     send_message("pong 🟢")
@@ -636,37 +615,16 @@ def command_loop():
                     send_message(test_odds_api())
                 elif text == "/test_football":
                     send_message(test_football_api())
-                elif text == "/partidos":
-                    try:
-                        events = odds_get(
-                            f"/sports/{current_sport_key()}/events",
-                            {"apiKey": ODDS_API_KEY}
-                        )
-
-                        if not events:
-                            send_message(f"No hay partidos disponibles en {current_league_name()}")
-                            continue
-
-                        mensaje = f"📊 Próximos partidos ({current_league_name()}):\n\n"
-                        for partido in events[:5]:
-                            home = partido.get("home_team", "Local")
-                            away = partido.get("away_team", "Visitante")
-                            mensaje += f"{home} vs {away}\n"
-
-                        send_message(mensaje)
-
-                    except Exception as e:
-                        send_message(f"Error partidos ❌ {e}")
-                elif text == "/cuotas":
-                    send_message(get_match_odds_message())
-                elif text == "/value":
-                    send_message(get_value_message())
-                elif text == "/stats":
-                    send_message(stats_command())
+                elif text == "/corners_partidos":
+                    send_message(get_corners_partidos_message())
+                elif text == "/corners_cuotas":
+                    send_message(get_corners_odds_message())
+                elif text == "/corners_stats":
+                    send_message(get_corners_stats_message())
+                elif text == "/corners_value":
+                    send_message(get_corners_value_message())
                 elif text == "/debug_fixture":
                     send_message(get_debug_fixture_message())
-                elif text == "/debug_squad":
-                    send_message(get_debug_squad_message())
 
         except Exception as e:
             print("command_loop error:", e)
@@ -674,7 +632,7 @@ def command_loop():
 
 
 def main():
-    send_message(f"🔥 Bot PRO iniciando 🔥\nLiga activa: {ACTIVE_LEAGUE} ({current_league_name()})")
+    send_message(f"🔥 Bot córners iniciando 🔥\nLiga activa: {ACTIVE_LEAGUE} ({current_league_name()})")
     t1 = threading.Thread(target=heartbeat, daemon=True)
     t2 = threading.Thread(target=command_loop, daemon=True)
     t1.start()
