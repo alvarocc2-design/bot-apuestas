@@ -56,6 +56,47 @@ def test_football_api() -> str:
     except Exception as e:
         return f"API-FOOTBALL ERROR ❌ {e}"
 
+def get_match_odds_message() -> str:
+    try:
+        url = "https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/events"
+        url += "?" + urllib.parse.urlencode({"apiKey": ODDS_API_KEY})
+
+        with urllib.request.urlopen(url, timeout=30) as response:
+            events = json.loads(response.read().decode("utf-8"))
+
+        if not events:
+            return "No encontré eventos."
+
+        event_id = events[0].get("id")
+        home = events[0].get("home_team", "Local")
+        away = events[0].get("away_team", "Visitante")
+
+        odds_url = f"https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/events/{event_id}/odds"
+        odds_url += "?" + urllib.parse.urlencode({
+            "apiKey": ODDS_API_KEY,
+            "regions": "us,us2",
+            "markets": "player_shots,player_shots_on_target,player_to_receive_card",
+            "oddsFormat": "decimal"
+        })
+
+        with urllib.request.urlopen(odds_url, timeout=30) as response:
+            odds_data = json.loads(response.read().decode("utf-8"))
+
+        bookmakers = odds_data.get("bookmakers", [])
+        if not bookmakers:
+            return f"No encontré cuotas para {home} vs {away}"
+
+        mensaje = f"💰 Cuotas detectadas para:\n{home} vs {away}\n\n"
+        mensaje += f"Bookmakers detectados: {len(bookmakers)}\n"
+
+        for book in bookmakers[:3]:
+            mensaje += f"- {book.get('title', 'Bookmaker')}\n"
+
+        return mensaje
+
+    except Exception as e:
+        return f"Error cuotas ❌ {e}"
+
 def heartbeat():
     while True:
         try:
@@ -82,7 +123,7 @@ def command_loop():
                 text = message.get("text", "")
 
                 if text == "/start":
-                    send_message("🤖 Bot conectado. Comandos: /ping /status /test_odds /test_football /liga /partidos")
+                    send_message("🤖 Bot conectado. Comandos: /ping /status /test_odds /test_football /liga /partidos /cuotas")
                 elif text == "/ping":
                     send_message("pong 🟢")
                 elif text == "/status":
@@ -115,6 +156,8 @@ def command_loop():
 
                     except Exception as e:
                         send_message(f"Error partidos ❌ {e}")
+                elif text == "/cuotas":
+                    send_message(get_match_odds_message())
 
         except Exception as e:
             print("command_loop error:", e)
