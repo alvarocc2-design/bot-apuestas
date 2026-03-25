@@ -86,11 +86,33 @@ def get_match_odds_message() -> str:
         if not bookmakers:
             return f"No encontré cuotas para {home} vs {away}"
 
-        mensaje = f"💰 Cuotas detectadas para:\n{home} vs {away}\n\n"
-        mensaje += f"Bookmakers detectados: {len(bookmakers)}\n"
+        mensaje = f"💰 Cuotas para:\n{home} vs {away}\n\n"
 
-        for book in bookmakers[:3]:
-            mensaje += f"- {book.get('title', 'Bookmaker')}\n"
+        found_any_player_market = False
+
+        for book in bookmakers[:2]:
+            mensaje += f"🏪 {book.get('title', 'Bookmaker')}\n"
+
+            markets = book.get("markets", [])
+            for market in markets:
+                market_name = market.get("key")
+
+                if market_name in ["player_shots", "player_shots_on_target", "player_to_receive_card"]:
+                    outcomes = market.get("outcomes", [])
+                    if outcomes:
+                        found_any_player_market = True
+
+                    for outcome in outcomes[:3]:
+                        jugador = outcome.get("description") or outcome.get("name") or "Jugador"
+                        cuota = outcome.get("price", "")
+                        linea = outcome.get("point", "")
+
+                        mensaje += f"{jugador} | {market_name} {linea} → {cuota}\n"
+
+            mensaje += "\n"
+
+        if not found_any_player_market:
+            return f"No encontré mercados de jugador para {home} vs {away}"
 
         return mensaje
 
