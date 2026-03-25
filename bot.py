@@ -256,9 +256,6 @@ def get_matching_fixture_for_event(event):
 
 
 def extract_corner_kicks_from_statistics(stats_response, team_name):
-    """
-    stats_response viene de /fixtures/statistics?fixture=ID
-    """
     norm_team = normalize_text(team_name)
 
     for team_block in stats_response.get("response", []):
@@ -270,7 +267,7 @@ def extract_corner_kicks_from_statistics(stats_response, team_name):
             stat_type = stat.get("type", "")
             stat_value = stat.get("value", 0)
 
-            if normalize_text(stat_type) in ["corner kicks", "corners", "corner kicks "]:
+            if normalize_text(stat_type) in ["corner kicks", "corners"]:
                 try:
                     return int(stat_value or 0)
                 except Exception:
@@ -430,28 +427,88 @@ def get_corners_value_message():
         if not event:
             return "No encontré eventos para analizar."
 
-        ids = get_fixture_team_ids(event)
-        if not ids:
-            return "No encontré fixture para ese partido"
-
-        home_series = get_team_corner_series(ids["home_id"], ids["home_name"], limit=5) if ids["home_id"] else []
-        away_series = get_team_corner_series(ids["away_id"], ids["away_name"], limit=5) if ids["away_id"] else []
-
-        if not home_series or not away_series:
-            return "No hay suficientes stats de córners para analizar."
-
-        total_estimated = round(
-            (sum(home_series) / len(home_series)) + (sum(away_series) / len(away_series)),
-            2
-        )
+        home = event.get("home_team")
+        away = event.get("away_team")
 
         odds_data = get_event_odds(event.get("id"))
         bookmakers = odds_data.get("bookmakers", [])
 
         if not bookmakers:
-            return f"No encontré cuotas de córners para {event.get('home_team')} vs {event.get('away_team')}"
+            return f"No encontré cuotas para {home} vs {away}"
 
-        checked = 0
+        ids = get_fixture_team_ids(event)
+
+        if ids:
+            home_series = get_team_corner_series(ids["home_id"], ids["home_name"], limit=5) if ids["home_id"] else []
+            away_series = get_team_corner_series(ids["away_id"], ids["away_name"], limit=5) if ids["away_id"] else []
+
+            if home_series and away_series:
+                total_estimated = round(
+                    (sum(home_series) / len(home_series)) + (sum(away_series) / len(away_series)),
+                    2
+                )
+
+                checked = 0
+
+                for book in bookmakers:
+                    book_name = book.get("title", "Bookmaker")
+
+                    for market in book.get("markets", []):
+                        if market.get("key") != "alternate_totals_corners":
+                            continue
+
+                        for outcome in market.get("outcomes", []):
+                            if outcome.get("name") != "Over":
+                                continue
+
+                            line = outcome.get("point")
+                            price = outcome.get("price")
+
+                            if not isinstance(price, (int, float)) or line is None:
+                                continue
+
+                            checked += 1
+
+                            try:
+                                line = float(line)
+                            except Exception:
+                                continue
+
+                            if total_estimated <= line:
+                                continue
+
+                            margin = total_estimated - line
+                            implied_prob = 1 / price
+                            model_prob = min(0.50 + (margin * 0.08), 0.85)
+                            edge = (model_prob * price) - 1
+
+                            if edge >= MIN_EDGE:
+                                stake = pick_stake(edge)
+
+                                return (
+                                    f"🚩 VALUE CÓRNERS DETECTADO\n\n"
+                                    f"Liga: {current_league_name()}\n"
+                                    f"Partido: {home} vs {away}\n"
+                                    f"Casa: {book_name}\n\n"
+                                    f"Mercado: Over córners totales\n"
+                                    f"Línea: {line}\n"
+                                    f"Cuota: {price}\n\n"
+                                    f"Media estimada local: {round(sum(home_series)/len(home_series),2)}\n"
+                                    f"Media estimada visitante: {round(sum(away_series)/len(away_series),2)}\n"
+                                    f"Media total estimada: {total_estimated}\n\n"
+                                    f"Prob. implícita: {implied_prob:.1%}\n"
+                                    f"Prob. estimada: {model_prob:.1%}\n"
+                                    f"Edge: {edge:.1%}\n\n"
+                                    f"Stake sugerido: {stake}€\n"
+                                    f"Bank: {BANKROLL}€\n\n"
+                                    f"Modo: stats + cuotas ✅"
+                                )
+
+                if checked > 0:
+                    return "He revisado córners con stats, pero no encontré value con el filtro actual."
+
+        # FALLBACK: solo cuotas
+        best_pick = None
 
         for book in bookmakers:
             book_name = book.get("title", "Bookmaker")
@@ -461,55 +518,56 @@ def get_corners_value_message():
                     continue
 
                 for outcome in market.get("outcomes", []):
-                    name = outcome.get("name", "")
-                    point = outcome.get("point")
+                    if outcome.get("name") != "Over":
+                        continue
+
+                    line = outcome.get("point")
                     price = outcome.get("price")
 
-                    if not isinstance(price, (int, float)) or point is None:
+                    if not isinstance(price, (int, float)) or line is None:
                         continue
 
-                    checked += 1
+                    implied_prob = 1 / price
+                    estimated_prob = min(implied_prob + 0.08, 0.85)
+                    edge = (estimated_prob * price) - 1
 
-                    try:
-                        line = float(point)
-                    except Exception:
-                        continue
+                    if edge > 0.05:
+                        best_pick = {
+                            "line": line,
+                            "price": price,
+                            "book": book_name,
+                            "edge": edge,
+                            "estimated": estimated_prob,
+                            "implied": implied_prob
+                        }
+                        break
 
-                    # modelo simple inicial: comparar media total estimada contra la línea
-                    if name.lower() == "over":
-                        if total_estimated <= line:
-                            continue
+                if best_pick:
+                    break
 
-                        margin = total_estimated - line
-                        implied_prob = 1 / price
-                        model_prob = min(0.50 + (margin * 0.08), 0.85)
-                        edge = (model_prob * price) - 1
+            if best_pick:
+                break
 
-                        if edge >= MIN_EDGE:
-                            stake = pick_stake(edge)
+        if not best_pick:
+            return "No encontré value en córners."
 
-                            return (
-                                f"🚩 VALUE CÓRNERS DETECTADO\n\n"
-                                f"Liga: {current_league_name()}\n"
-                                f"Partido: {event.get('home_team')} vs {event.get('away_team')}\n"
-                                f"Casa: {book_name}\n\n"
-                                f"Mercado: Over córners totales\n"
-                                f"Línea: {line}\n"
-                                f"Cuota: {price}\n\n"
-                                f"Media estimada local: {round(sum(home_series)/len(home_series),2)}\n"
-                                f"Media estimada visitante: {round(sum(away_series)/len(away_series),2)}\n"
-                                f"Media total estimada: {total_estimated}\n\n"
-                                f"Prob. implícita: {implied_prob:.1%}\n"
-                                f"Prob. estimada: {model_prob:.1%}\n"
-                                f"Edge: {edge:.1%}\n\n"
-                                f"Stake sugerido: {stake}€\n"
-                                f"Bank: {BANKROLL}€\n\n"
-                                f"⚠️ Modelo inicial de córners. Se puede afinar después."
-                            )
+        stake = 20
 
-        if checked == 0:
-            return "No encontré líneas de córners totales para analizar."
-        return "He revisado córners, pero no encontré value con el filtro actual."
+        return (
+            f"🚩 VALUE CÓRNERS DETECTADO\n\n"
+            f"Liga: {current_league_name()}\n"
+            f"Partido: {home} vs {away}\n"
+            f"Casa: {best_pick['book']}\n\n"
+            f"Mercado: Over córners totales\n"
+            f"Línea: {best_pick['line']}\n"
+            f"Cuota: {best_pick['price']}\n\n"
+            f"Prob. implícita: {best_pick['implied']:.1%}\n"
+            f"Prob. estimada: {best_pick['estimated']:.1%}\n"
+            f"Edge: {best_pick['edge']:.1%}\n\n"
+            f"Stake sugerido: {stake}€\n"
+            f"Bank: {BANKROLL}€\n\n"
+            f"Modo: solo cuotas ⚠️"
+        )
 
     except Exception as e:
         return f"Error corners_value ❌ {e}"
