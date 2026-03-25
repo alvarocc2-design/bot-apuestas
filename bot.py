@@ -42,29 +42,6 @@ def test_odds_api() -> str:
         return f"ODDS API ERROR ❌ {e}"
 
 def test_football_api() -> str:
-    elif text == "/partidos":
-    try:
-        url = "https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/events"
-        url += "?apiKey=" + ODDS_API_KEY
-
-        with urllib.request.urlopen(url, timeout=30) as response:
-            data = json.loads(response.read().decode("utf-8"))
-
-        if not data:
-            send_message("No hay partidos disponibles")
-            continue
-
-        mensaje = "📊 Próximos partidos:\n\n"
-
-        for partido in data[:5]:
-            home = partido.get("home_team")
-            away = partido.get("away_team")
-            mensaje += f"{home} vs {away}\n"
-
-        send_message(mensaje)
-
-    except Exception as e:
-        send_message(f"Error partidos ❌ {e}")
     if not API_FOOTBALL_KEY:
         return "Falta API_FOOTBALL_KEY"
     url = "https://v3.football.api-sports.io/status"
