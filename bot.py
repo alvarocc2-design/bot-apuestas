@@ -5,6 +5,7 @@ import json
 import urllib.request
 import urllib.parse
 import unicodedata
+import math
 from datetime import datetime, timedelta, timezone
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -281,7 +282,11 @@ def get_matching_fixture_for_event(event):
         return None
 
 
-def extract_corner_kicks_from_statistics(stats_response, team_name):
+def get_fixture_statistics(fixture_id: int):
+    return football_get("/fixtures/statistics", {"fixture": fixture_id})
+
+
+def extract_team_corners(stats_response, team_name):
     norm_team = normalize_text(team_name)
 
     for team_block in stats_response.get("response", []):
@@ -290,10 +295,10 @@ def extract_corner_kicks_from_statistics(stats_response, team_name):
             continue
 
         for stat in team_block.get("statistics", []):
-            stat_type = stat.get("type", "")
+            stat_type = normalize_text(stat.get("type", ""))
             stat_value = stat.get("value", 0)
 
-            if normalize_text(stat_type) in ["corner kicks", "corners"]:
+            if stat_type in ["corner kicks", "corners"]:
                 try:
                     return int(stat_value or 0)
                 except Exception:
@@ -301,37 +306,19 @@ def extract_corner_kicks_from_statistics(stats_response, team_name):
     return None
 
 
-def get_fixture_statistics(fixture_id: int):
-    return football_get("/fixtures/statistics", {"fixture": fixture_id})
+def extract_match_corner_pair(stats_response, home_name, away_name):
+    home_corners = extract_team_corners(stats_response, home_name)
+    away_corners = extract_team_corners(stats_response, away_name)
+    return home_corners, away_corners
 
 
-def get_recent_team_fixtures(team_id: int, limit: int = 5):
+def get_recent_team_fixtures(team_id: int, limit: int = 10):
     data = football_get("/fixtures", {
         "team": team_id,
         "league": current_football_league_id(),
         "last": limit
     })
     return data.get("response", [])
-
-
-def get_team_corner_series(team_id: int, team_name: str, limit: int = 5):
-    fixtures = get_recent_team_fixtures(team_id, limit=limit)
-    values = []
-
-    for fx in fixtures:
-        fixture_id = fx.get("fixture", {}).get("id")
-        if not fixture_id:
-            continue
-
-        try:
-            stats = get_fixture_statistics(fixture_id)
-            corners = extract_corner_kicks_from_statistics(stats, team_name)
-            if corners is not None:
-                values.append(corners)
-        except Exception:
-            continue
-
-    return values
 
 
 def get_fixture_team_ids(event):
@@ -349,6 +336,101 @@ def get_fixture_team_ids(event):
         "away_name": away.get("name", event.get("away_team", "Visitante")),
         "fixture_id": fixture.get("fixture", {}).get("id")
     }
+
+
+def get_team_corner_profile(team_id: int, team_name: str, venue: str, limit: int = 10):
+    fixtures = get_recent_team_fixtures(team_id, limit=limit)
+    corners_for = []
+    corners_against = []
+    totals = []
+
+    for fx in fixtures:
+        fixture_id = fx.get("fixture", {}).get("id")
+        if not fixture_id:
+            continue
+
+        home_team = fx.get("teams", {}).get("home", {})
+        away_team = fx.get("teams", {}).get("away", {})
+
+        is_home = team_names_match(team_name, home_team.get("name", ""))
+        is_away = team_names_match(team_name, away_team.get("name", ""))
+
+        if venue == "home" and not is_home:
+            continue
+        if venue == "away" and not is_away:
+            continue
+        if not is_home and not is_away:
+            continue
+
+        try:
+            stats = get_fixture_statistics(fixture_id)
+            home_corners, away_corners = extract_match_corner_pair(
+                stats,
+                home_team.get("name", ""),
+                away_team.get("name", "")
+            )
+
+            if home_corners is None or away_corners is None:
+                continue
+
+            if is_home:
+                team_for = home_corners
+                team_against = away_corners
+            else:
+                team_for = away_corners
+                team_against = home_corners
+
+            corners_for.append(team_for)
+            corners_against.append(team_against)
+            totals.append(team_for + team_against)
+
+        except Exception:
+            continue
+
+    return {
+        "for": corners_for,
+        "against": corners_against,
+        "totals": totals
+    }
+
+
+def avg(values):
+    return round(sum(values) / len(values), 2) if values else 0.0
+
+
+def estimate_total_corners(home_profile, away_profile):
+    """
+    Modelo PRO heurístico:
+    - home expected = mezcla de córners a favor del local en casa + córners que concede el visitante fuera
+    - away expected = mezcla de córners a favor del visitante fuera + córners que concede el local en casa
+    - total = suma de ambos
+    """
+    home_for_home = avg(home_profile["for"])
+    home_against_home = avg(home_profile["against"])
+    away_for_away = avg(away_profile["for"])
+    away_against_away = avg(away_profile["against"])
+
+    home_expected = (home_for_home * 0.55) + (away_against_away * 0.45)
+    away_expected = (away_for_away * 0.55) + (home_against_home * 0.45)
+
+    total_expected = round(home_expected + away_expected, 2)
+    return {
+        "home_expected": round(home_expected, 2),
+        "away_expected": round(away_expected, 2),
+        "total_expected": total_expected
+    }
+
+
+def probability_over_from_expected(mean_total, line_total):
+    """
+    Aproximación normal simple.
+    Más robusta que el modelo lineal anterior.
+    """
+    sigma = max(1.8, (mean_total * 0.22) + 1.0)
+    z = (line_total - mean_total) / sigma
+    cdf = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+    prob_over = 1.0 - cdf
+    return max(0.05, min(prob_over, 0.95))
 
 
 def get_corners_partidos_message():
@@ -433,20 +515,22 @@ def get_corners_stats_message():
         if not ids:
             return "No encontré fixture para ese partido"
 
-        home_series = get_team_corner_series(ids["home_id"], ids["home_name"], limit=5) if ids["home_id"] else []
-        away_series = get_team_corner_series(ids["away_id"], ids["away_name"], limit=5) if ids["away_id"] else []
+        home_profile = get_team_corner_profile(ids["home_id"], ids["home_name"], "home", limit=10) if ids["home_id"] else {"for": [], "against": [], "totals": []}
+        away_profile = get_team_corner_profile(ids["away_id"], ids["away_name"], "away", limit=10) if ids["away_id"] else {"for": [], "against": [], "totals": []}
 
-        home_avg = round(sum(home_series) / len(home_series), 2) if home_series else 0
-        away_avg = round(sum(away_series) / len(away_series), 2) if away_series else 0
-        total_avg = round(home_avg + away_avg, 2)
+        estimate = estimate_total_corners(home_profile, away_profile)
 
         return (
-            f"📊 Stats córners ({current_league_name()})\n\n"
-            f"{ids['home_name']}: {home_series if home_series else 'sin datos'}\n"
-            f"Media: {home_avg}\n\n"
-            f"{ids['away_name']}: {away_series if away_series else 'sin datos'}\n"
-            f"Media: {away_avg}\n\n"
-            f"Media total estimada: {total_avg}"
+            f"📊 Stats córners PRO ({current_league_name()})\n\n"
+            f"{ids['home_name']} en casa:\n"
+            f"A favor: {home_profile['for'] if home_profile['for'] else 'sin datos'}\n"
+            f"En contra: {home_profile['against'] if home_profile['against'] else 'sin datos'}\n\n"
+            f"{ids['away_name']} fuera:\n"
+            f"A favor: {away_profile['for'] if away_profile['for'] else 'sin datos'}\n"
+            f"En contra: {away_profile['against'] if away_profile['against'] else 'sin datos'}\n\n"
+            f"Esperado local: {estimate['home_expected']}\n"
+            f"Esperado visitante: {estimate['away_expected']}\n"
+            f"Total esperado: {estimate['total_expected']}"
         )
 
     except Exception as e:
@@ -474,16 +558,14 @@ def get_corners_value_message():
         ids = get_fixture_team_ids(event)
 
         if ids:
-            home_series = get_team_corner_series(ids["home_id"], ids["home_name"], limit=5) if ids["home_id"] else []
-            away_series = get_team_corner_series(ids["away_id"], ids["away_name"], limit=5) if ids["away_id"] else []
+            home_profile = get_team_corner_profile(ids["home_id"], ids["home_name"], "home", limit=10) if ids["home_id"] else {"for": [], "against": [], "totals": []}
+            away_profile = get_team_corner_profile(ids["away_id"], ids["away_name"], "away", limit=10) if ids["away_id"] else {"for": [], "against": [], "totals": []}
 
-            if home_series and away_series:
-                total_estimated = round(
-                    (sum(home_series) / len(home_series)) + (sum(away_series) / len(away_series)),
-                    2
-                )
+            if home_profile["for"] and away_profile["for"]:
+                estimate = estimate_total_corners(home_profile, away_profile)
+                total_expected = estimate["total_expected"]
 
-                checked = 0
+                best_pick = None
 
                 for book in bookmakers:
                     book_name = book.get("title", "Bookmaker")
@@ -502,45 +584,50 @@ def get_corners_value_message():
                             if not isinstance(price, (int, float)) or line is None:
                                 continue
 
-                            checked += 1
-
                             try:
-                                line = float(line)
+                                line_float = float(line)
                             except Exception:
                                 continue
 
-                            if total_estimated <= line:
-                                continue
-
-                            margin = total_estimated - line
                             implied_prob = 1 / price
-                            model_prob = min(0.50 + (margin * 0.08), 0.85)
+                            model_prob = probability_over_from_expected(total_expected, line_float)
                             edge = (model_prob * price) - 1
 
                             if edge >= MIN_EDGE:
-                                stake = pick_stake(edge)
+                                candidate = {
+                                    "book": book_name,
+                                    "line": line_float,
+                                    "price": price,
+                                    "implied": implied_prob,
+                                    "estimated": model_prob,
+                                    "edge": edge
+                                }
 
-                                return (
-                                    f"🚩 VALUE CÓRNERS DETECTADO\n\n"
-                                    f"Liga: {current_league_name()}\n"
-                                    f"Partido: {home} vs {away}\n"
-                                    f"Casa: {book_name}\n\n"
-                                    f"Mercado: Over córners totales\n"
-                                    f"Línea: {line}\n"
-                                    f"Cuota: {price}\n\n"
-                                    f"Media estimada local: {round(sum(home_series)/len(home_series),2)}\n"
-                                    f"Media estimada visitante: {round(sum(away_series)/len(away_series),2)}\n"
-                                    f"Media total estimada: {total_estimated}\n\n"
-                                    f"Prob. implícita: {implied_prob:.1%}\n"
-                                    f"Prob. estimada: {model_prob:.1%}\n"
-                                    f"Edge: {edge:.1%}\n\n"
-                                    f"Stake sugerido: {stake}€\n"
-                                    f"Bank: {BANKROLL}€\n\n"
-                                    f"Modo: stats + cuotas ✅"
-                                )
+                                if best_pick is None or candidate["edge"] > best_pick["edge"]:
+                                    best_pick = candidate
 
-                if checked > 0:
-                    return "He revisado córners con tus casas y con stats, pero no encontré value con el filtro actual."
+                if best_pick:
+                    stake = pick_stake(best_pick["edge"])
+                    return (
+                        f"🚩 VALUE CÓRNERS DETECTADO\n\n"
+                        f"Liga: {current_league_name()}\n"
+                        f"Partido: {home} vs {away}\n"
+                        f"Casa: {best_pick['book']}\n\n"
+                        f"Mercado: Over córners totales\n"
+                        f"Línea: {best_pick['line']}\n"
+                        f"Cuota: {best_pick['price']}\n\n"
+                        f"Esperado local: {estimate['home_expected']}\n"
+                        f"Esperado visitante: {estimate['away_expected']}\n"
+                        f"Total esperado: {estimate['total_expected']}\n\n"
+                        f"Prob. implícita: {best_pick['implied']:.1%}\n"
+                        f"Prob. estimada: {best_pick['estimated']:.1%}\n"
+                        f"Edge: {best_pick['edge']:.1%}\n\n"
+                        f"Stake sugerido: {stake}€\n"
+                        f"Bank: {BANKROLL}€\n\n"
+                        f"Modo: stats + cuotas ✅"
+                    )
+
+                return "He revisado córners con tus casas y con stats, pero no encontré value con el filtro actual."
 
         # FALLBACK: solo cuotas
         best_pick = None
@@ -567,7 +654,7 @@ def get_corners_value_message():
                     edge = (estimated_prob * price) - 1
 
                     if edge > 0.05:
-                        best_pick = {
+                        candidate = {
                             "line": line,
                             "price": price,
                             "book": book_name,
@@ -575,13 +662,8 @@ def get_corners_value_message():
                             "estimated": estimated_prob,
                             "implied": implied_prob
                         }
-                        break
-
-                if best_pick:
-                    break
-
-            if best_pick:
-                break
+                        if best_pick is None or candidate["edge"] > best_pick["edge"]:
+                            best_pick = candidate
 
         if not best_pick:
             return "No encontré value en córners en tus casas."
@@ -650,8 +732,8 @@ def get_debug_fixture_message():
 def heartbeat():
     while True:
         try:
-            time.sleep(300)
-            send_message("Sigo activo ✅")
+            time.sleep(1800)
+            print("heartbeat ok")
         except Exception as e:
             print("heartbeat error:", e)
             time.sleep(30)
@@ -730,7 +812,7 @@ def command_loop():
 
 def main():
     send_message(
-        f"🔥 Bot córners iniciando 🔥\n"
+        f"🔥 Bot córners PRO iniciando 🔥\n"
         f"Liga activa: {ACTIVE_LEAGUE} ({current_league_name()})\n"
         f"{allowed_bookmakers_message()}"
     )
