@@ -13,8 +13,8 @@ API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
 
 BANKROLL = 1000
 MIN_EDGE = 0.08
-LEAGUE_ID = 140   # La Liga
-SEASON = 2024     # ajusta si hace falta
+LEAGUE_ID = 140
+SEASON = 2024
 
 def send_message(text: str) -> None:
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -103,6 +103,155 @@ def get_event_odds(event_id: str):
         }
     )
 
+def team_names_match(a: str, b: str) -> bool:
+    na = normalize_text(a)
+    nb = normalize_text(b)
+    return na == nb or na in nb or nb in na
+
+def get_matching_fixture_for_event(event):
+    try:
+        event_date = (event.get("commence_time") or "")[:10]
+        home = event.get("home_team", "")
+        away = event.get("away_team", "")
+
+        data = football_get("/fixtures", {
+            "league": LEAGUE_ID,
+            "season": SEASON,
+            "date": event_date
+        })
+
+        fixtures = data.get("response", [])
+
+        for f in fixtures:
+            home_name = f.get("teams", {}).get("home", {}).get("name", "")
+            away_name = f.get("teams", {}).get("away", {}).get("name", "")
+            if team_names_match(home, home_name) and team_names_match(away, away_name):
+                return f
+
+        for f in fixtures:
+            home_name = f.get("teams", {}).get("home", {}).get("name", "")
+            away_name = f.get("teams", {}).get("away", {}).get("name", "")
+            if team_names_match(home, home_name) or team_names_match(away, away_name):
+                return f
+
+        return None
+    except Exception as e:
+        print("get_matching_fixture_for_event error:", e)
+        return None
+
+def get_team_squad(team_id: int):
+    try:
+        data = football_get("/players/squads", {"team": team_id})
+        response = data.get("response", [])
+        if not response:
+            return []
+        return response[0].get("players", [])
+    except Exception as e:
+        print("get_team_squad error:", e)
+        return []
+
+def resolve_player_id_from_event_player(name: str, event) -> int | None:
+    norm_target = normalize_text(name)
+    target_parts = norm_target.split()
+
+    print(f"🔍 Buscando jugador: {name}")
+
+    fixture = get_matching_fixture_for_event(event)
+
+    if not fixture:
+        print("❌ No encontré fixture")
+        return None
+
+    home_team = fixture.get("teams", {}).get("home", {})
+    away_team = fixture.get("teams", {}).get("away", {})
+
+    print(f"🏟 Equipos detectados: {home_team.get('name')} vs {away_team.get('name')}")
+
+    squad = []
+
+    if home_team.get("id"):
+        squad += get_team_squad(home_team["id"])
+    if away_team.get("id"):
+        squad += get_team_squad(away_team["id"])
+
+    print(f"👥 Jugadores en plantilla: {len(squad)}")
+
+    best_id = None
+    best_score = 0
+
+    for p in squad:
+        player_name = normalize_text(p.get("name", ""))
+        score = 0
+
+        if player_name == norm_target:
+            score = 100
+        elif norm_target in player_name:
+            score = 90
+        else:
+            shared = sum(1 for part in target_parts if part in player_name.split())
+            score = shared * 25
+
+        if score > best_score:
+            best_score = score
+            best_id = p.get("id")
+
+    print(f"🏆 Mejor score: {best_score}")
+
+    if best_score >= 25:
+        print(f"✅ Jugador encontrado con ID: {best_id}")
+        return best_id
+
+    print("❌ No se encontró jugador en plantilla")
+    return None
+
+def get_player_stats(player_name):
+    event = get_first_laliga_event()
+    if not event:
+        return "No encontré evento para resolver el jugador"
+
+    player_id = resolve_player_id_from_event_player(player_name, event)
+    if not player_id:
+        return f"No encontré ID para {player_name}"
+
+    try:
+        data = football_get("/players", {
+            "id": player_id,
+            "season": SEASON
+        })
+
+        if not data.get("response"):
+            return f"No encontré estadísticas para {player_name}"
+
+        stats_blocks = data["response"][0].get("statistics", [])
+        if not stats_blocks:
+            return f"No encontré estadísticas para {player_name}"
+
+        best_block = max(
+            stats_blocks,
+            key=lambda s: (s.get("games", {}).get("appearences") or 0)
+        )
+
+        tiros = best_block.get("shots", {}).get("total") or 0
+        tiros_puerta = best_block.get("shots", {}).get("on") or 0
+        partidos = best_block.get("games", {}).get("appearences") or 1
+        team_name = best_block.get("team", {}).get("name", "Equipo")
+
+        media_tiros = round(tiros / partidos, 2) if partidos else 0
+        media_tiros_puerta = round(tiros_puerta / partidos, 2) if partidos else 0
+
+        return (
+            f"📊 Stats {player_name}\n\n"
+            f"Equipo: {team_name}\n"
+            f"Partidos: {partidos}\n"
+            f"Tiros totales: {tiros}\n"
+            f"Tiros a puerta: {tiros_puerta}\n"
+            f"Media tiros: {media_tiros}\n"
+            f"Media tiros a puerta: {media_tiros_puerta}"
+        )
+
+    except Exception as e:
+        return f"Error stats ❌ {e}"
+
 def get_match_odds_message() -> str:
     try:
         event = get_first_laliga_event()
@@ -159,206 +308,13 @@ def get_first_player_from_props():
                 outcomes = market.get("outcomes", [])
                 if outcomes:
                     return outcomes[0].get("description")
+
     return None
 
 def test_probability_from_odds(price: float) -> float:
     implied = 1 / price
     boosted = implied + 0.10
     return min(boosted, 0.85)
-
-def team_names_match(a: str, b: str) -> bool:
-    na = normalize_text(a)
-    nb = normalize_text(b)
-    return na == nb or na in nb or nb in na
-
-def get_matching_fixture_for_event(event):
-    try:
-        event_date = (event.get("commence_time") or "")[:10]
-        home = event.get("home_team", "")
-        away = event.get("away_team", "")
-
-        data = football_get("/fixtures", {
-            "league": LEAGUE_ID,
-            "season": SEASON,
-            "date": event_date
-        })
-
-        fixtures = data.get("response", [])
-        for f in fixtures:
-            home_name = f.get("teams", {}).get("home", {}).get("name", "")
-            away_name = f.get("teams", {}).get("away", {}).get("name", "")
-
-            if team_names_match(home, home_name) and team_names_match(away, away_name):
-                return f
-
-        # fallback suave
-        for f in fixtures:
-            home_name = f.get("teams", {}).get("home", {}).get("name", "")
-            away_name = f.get("teams", {}).get("away", {}).get("name", "")
-            if team_names_match(home, home_name) or team_names_match(away, away_name):
-                return f
-
-        return None
-    except Exception:
-        return None
-
-def get_team_squad(team_id: int):
-    try:
-        data = football_get("/players/squads", {"team": team_id})
-        response = data.get("response", [])
-        if not response:
-            return []
-        players = response[0].get("players", [])
-        return players
-    except Exception:
-        return []
-
-def candidate_queries(name: str):
-    norm = normalize_text(name)
-    parts = norm.split()
-    queries = [norm]
-
-    if len(parts) >= 2:
-        queries.append(" ".join(parts[:2]))
-        queries.append(" ".join(parts[-2:]))
-        queries.append(parts[0])
-        queries.append(parts[-1])
-    elif len(parts) == 1:
-        queries.append(parts[0])
-
-    out = []
-    seen = set()
-    for q in queries:
-        if q and q not in seen:
-            out.append(q)
-            seen.add(q)
-    return out
-
-def search_players_api(query: str):
-    try:
-        data = football_get("/players", {"search": query})
-        return data.get("response", [])
-    except Exception:
-        return []
-
-def resolve_player_id_from_event_player(name: str, event) -> int | None:
-    norm_target = normalize_text(name)
-    target_parts = norm_target.split()
-
-    fixture = get_matching_fixture_for_event(event)
-    if fixture:
-        home_team_id = fixture.get("teams", {}).get("home", {}).get("id")
-        away_team_id = fixture.get("teams", {}).get("away", {}).get("id")
-
-        squad = []
-        if home_team_id:
-            squad.extend(get_team_squad(home_team_id))
-        if away_team_id:
-            squad.extend(get_team_squad(away_team_id))
-
-        best_id = None
-        best_score = -1
-
-        for p in squad:
-            candidate_name = normalize_text(p.get("name", ""))
-            score = 0
-
-            if candidate_name == norm_target:
-                score = 100
-            elif norm_target in candidate_name:
-                score = 90
-            elif candidate_name in norm_target:
-                score = 80
-            else:
-                shared = sum(1 for part in target_parts if part in candidate_name.split())
-                score = shared * 20
-
-            if score > best_score:
-                best_score = score
-                best_id = p.get("id")
-
-        if best_id and best_score >= 20:
-            return best_id
-
-    # fallback a búsqueda global
-    best_match = None
-    best_score = -1
-
-    for query in candidate_queries(name):
-        results = search_players_api(query)
-
-        for item in results:
-            player = item.get("player", {})
-            candidate_name = normalize_text(player.get("name", ""))
-
-            score = 0
-            if candidate_name == norm_target:
-                score = 100
-            elif norm_target in candidate_name:
-                score = 90
-            elif candidate_name in norm_target:
-                score = 80
-            else:
-                shared = sum(1 for part in target_parts if part in candidate_name.split())
-                score = shared * 20
-
-            if score > best_score:
-                best_score = score
-                best_match = player
-
-    if best_match and best_score >= 20:
-        return best_match.get("id")
-
-    return None
-
-def get_player_stats(player_name):
-    event = get_first_laliga_event()
-    if not event:
-        return "No encontré evento para resolver el jugador"
-
-    player_id = resolve_player_id_from_event_player(player_name, event)
-    if not player_id:
-        return f"No encontré ID para {player_name}"
-
-    try:
-        data = football_get("/players", {
-            "id": player_id,
-            "season": SEASON
-        })
-
-        if not data.get("response"):
-            return f"No encontré estadísticas para {player_name}"
-
-        # elegimos la estadística con más apariciones
-        stats_blocks = data["response"][0].get("statistics", [])
-        if not stats_blocks:
-            return f"No encontré estadísticas para {player_name}"
-
-        best_block = max(
-            stats_blocks,
-            key=lambda s: (s.get("games", {}).get("appearences") or 0)
-        )
-
-        tiros = best_block.get("shots", {}).get("total") or 0
-        tiros_puerta = best_block.get("shots", {}).get("on") or 0
-        partidos = best_block.get("games", {}).get("appearences") or 1
-        team_name = best_block.get("team", {}).get("name", "Equipo")
-
-        media_tiros = round(tiros / partidos, 2) if partidos else 0
-        media_tiros_puerta = round(tiros_puerta / partidos, 2) if partidos else 0
-
-        return (
-            f"📊 Stats {player_name}\n\n"
-            f"Equipo: {team_name}\n"
-            f"Partidos: {partidos}\n"
-            f"Tiros totales: {tiros}\n"
-            f"Tiros a puerta: {tiros_puerta}\n"
-            f"Media tiros: {media_tiros}\n"
-            f"Media tiros a puerta: {media_tiros_puerta}"
-        )
-
-    except Exception as e:
-        return f"Error stats ❌ {e}"
 
 def get_value_message() -> str:
     try:
@@ -414,7 +370,7 @@ def get_value_message() -> str:
                             f"Prob. estimada: {model_prob:.1%}\n"
                             f"Edge: {edge:.1%}\n\n"
                             f"Stake sugerido: {stake}€\n"
-                            f"Bank: 1000€\n\n"
+                            f"Bank: {BANKROLL}€\n\n"
                             f"⚠️ Este cálculo aún es de prueba. El siguiente paso será usar estadísticas reales."
                         )
 
