@@ -51,7 +51,16 @@ LEAGUES = {
     },
 }
 
-ACTIVE_LEAGUE = "hypermotion"
+ACTIVE_LEAGUE = "laliga"
+
+ALLOWED_BOOKMAKER_PATTERNS = [
+    "bet365",
+    "speedybet",
+    "winamax",
+    "betfair",
+    "bwin",
+    "yosports",
+]
 
 
 def send_message(text: str) -> None:
@@ -113,6 +122,22 @@ def current_league_name():
     return current_league_config()["name"]
 
 
+def bookmaker_allowed(title: str) -> bool:
+    norm = normalize_text(title).replace(" ", "")
+    for pattern in ALLOWED_BOOKMAKER_PATTERNS:
+        if pattern in norm:
+            return True
+    return False
+
+
+def filter_allowed_bookmakers(bookmakers):
+    return [b for b in bookmakers if bookmaker_allowed(b.get("title", ""))]
+
+
+def allowed_bookmakers_message():
+    return "Casas activas: Bet365, SpeedyBet, Winamax, Betfair, Bwin, YoSports"
+
+
 def list_leagues_message():
     lines = [f"🏆 Liga activa: {ACTIVE_LEAGUE} ({current_league_name()})", "", "Ligas disponibles:"]
     for key, cfg in LEAGUES.items():
@@ -120,6 +145,7 @@ def list_leagues_message():
         lines.append(f"{marker} {key} → {cfg['name']}")
     lines.append("")
     lines.append("Usa: /setliga <clave>")
+    lines.append(allowed_bookmakers_message())
     return "\n".join(lines)
 
 
@@ -353,15 +379,18 @@ def get_corners_odds_message():
         away = event.get("away_team", "Visitante")
 
         odds_data = get_event_odds(event_id)
-        bookmakers = odds_data.get("bookmakers", [])
+        bookmakers = filter_allowed_bookmakers(odds_data.get("bookmakers", []))
 
         if not bookmakers:
-            return f"No encontré cuotas de córners para {home} vs {away}"
+            return (
+                f"No encontré cuotas de córners para {home} vs {away}\n"
+                f"{allowed_bookmakers_message()}"
+            )
 
         mensaje = f"🚩 Cuotas de córners:\n{home} vs {away}\nLiga: {current_league_name()}\n\n"
         found_any = False
 
-        for book in bookmakers[:2]:
+        for book in bookmakers[:3]:
             mensaje += f"🏪 {book.get('title', 'Bookmaker')}\n"
 
             for market in book.get("markets", []):
@@ -371,7 +400,7 @@ def get_corners_odds_message():
                     if outcomes:
                         found_any = True
 
-                    for outcome in outcomes[:6]:
+                    for outcome in outcomes[:8]:
                         name = outcome.get("name", "")
                         point = outcome.get("point", "")
                         price = outcome.get("price", "")
@@ -383,7 +412,10 @@ def get_corners_odds_message():
             mensaje += "\n"
 
         if not found_any:
-            return f"No encontré mercados de córners para {home} vs {away}"
+            return (
+                f"No encontré mercados de córners para {home} vs {away}\n"
+                f"{allowed_bookmakers_message()}"
+            )
 
         return mensaje
 
@@ -431,10 +463,13 @@ def get_corners_value_message():
         away = event.get("away_team")
 
         odds_data = get_event_odds(event.get("id"))
-        bookmakers = odds_data.get("bookmakers", [])
+        bookmakers = filter_allowed_bookmakers(odds_data.get("bookmakers", []))
 
         if not bookmakers:
-            return f"No encontré cuotas para {home} vs {away}"
+            return (
+                f"No encontré cuotas de tus casas para {home} vs {away}\n"
+                f"{allowed_bookmakers_message()}"
+            )
 
         ids = get_fixture_team_ids(event)
 
@@ -505,7 +540,7 @@ def get_corners_value_message():
                                 )
 
                 if checked > 0:
-                    return "He revisado córners con stats, pero no encontré value con el filtro actual."
+                    return "He revisado córners con tus casas y con stats, pero no encontré value con el filtro actual."
 
         # FALLBACK: solo cuotas
         best_pick = None
@@ -549,7 +584,7 @@ def get_corners_value_message():
                 break
 
         if not best_pick:
-            return "No encontré value en córners."
+            return "No encontré value en córners en tus casas."
 
         stake = 20
 
@@ -659,7 +694,11 @@ def command_loop():
                 elif text == "/ping":
                     send_message("pong 🟢")
                 elif text == "/status":
-                    send_message(f"Estado actual: bot estable, Telegram OK.\nLiga activa: {ACTIVE_LEAGUE} ({current_league_name()})")
+                    send_message(
+                        f"Estado actual: bot estable, Telegram OK.\n"
+                        f"Liga activa: {ACTIVE_LEAGUE} ({current_league_name()})\n"
+                        f"{allowed_bookmakers_message()}"
+                    )
                 elif text == "/ligas":
                     send_message(list_leagues_message())
                 elif text.startswith("/setliga"):
@@ -690,7 +729,11 @@ def command_loop():
 
 
 def main():
-    send_message(f"🔥 Bot córners iniciando 🔥\nLiga activa: {ACTIVE_LEAGUE} ({current_league_name()})")
+    send_message(
+        f"🔥 Bot córners iniciando 🔥\n"
+        f"Liga activa: {ACTIVE_LEAGUE} ({current_league_name()})\n"
+        f"{allowed_bookmakers_message()}"
+    )
     t1 = threading.Thread(target=heartbeat, daemon=True)
     t2 = threading.Thread(target=command_loop, daemon=True)
     t1.start()
