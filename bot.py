@@ -1,29 +1,120 @@
 import os
 import time
-import threading
 import json
+import math
+import threading
 import urllib.request
 import urllib.parse
+from datetime import datetime, timezone
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
 
-# Configuración
+SPORT_KEY = "basketball_nba"
+REGIONS = "us"
+ODDS_FORMAT = "decimal"
+
+# Mercados a analizar
+MARKETS = {
+    "player_points": {
+        "label": "Puntos",
+        "stat_key": "PTS",
+        "emoji": "🏀",
+    },
+    "player_rebounds": {
+        "label": "Rebotes",
+        "stat_key": "REB",
+        "emoji": "💥",
+    },
+    "player_assists": {
+        "label": "Asistencias",
+        "stat_key": "AST",
+        "emoji": "🎯",
+    },
+    "player_threes": {
+        "label": "Triples",
+        "stat_key": "FG3M",
+        "emoji": "3️⃣",
+    },
+}
+
+# Configuración del modelo
 MIN_EDGE = 0.05
-MAX_LINE = 11.5
-PREFERRED_LINES = [8.5, 9.5, 10.5, 11.5]
+MIN_PRICE = 1.65
+MAX_PRICE = 2.40
+MIN_AVG_MINUTES = 20
+MAX_RESULTS = 5
+CACHE_TTL_SECONDS = 1800
+NBA_REQUEST_SLEEP = 0.8
+
+# Cabeceras para stats.nba.com
+NBA_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.nba.com/",
+    "Origin": "https://www.nba.com",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    "Connection": "keep-alive",
+}
+
+PLAYER_CACHE = {}
+TEAM_CACHE = {}
+GAMELOG_CACHE = {}
+
+TEAM_NAME_TO_ABBR = {
+    "Atlanta Hawks": "ATL",
+    "Boston Celtics": "BOS",
+    "Brooklyn Nets": "BKN",
+    "Charlotte Hornets": "CHA",
+    "Chicago Bulls": "CHI",
+    "Cleveland Cavaliers": "CLE",
+    "Dallas Mavericks": "DAL",
+    "Denver Nuggets": "DEN",
+    "Detroit Pistons": "DET",
+    "Golden State Warriors": "GSW",
+    "Houston Rockets": "HOU",
+    "Indiana Pacers": "IND",
+    "LA Clippers": "LAC",
+    "Los Angeles Clippers": "LAC",
+    "Los Angeles Lakers": "LAL",
+    "Memphis Grizzlies": "MEM",
+    "Miami Heat": "MIA",
+    "Milwaukee Bucks": "MIL",
+    "Minnesota Timberwolves": "MIN",
+    "New Orleans Pelicans": "NOP",
+    "New York Knicks": "NYK",
+    "Oklahoma City Thunder": "OKC",
+    "Orlando Magic": "ORL",
+    "Philadelphia 76ers": "PHI",
+    "Phoenix Suns": "PHX",
+    "Portland Trail Blazers": "POR",
+    "Sacramento Kings": "SAC",
+    "San Antonio Spurs": "SAS",
+    "Toronto Raptors": "TOR",
+    "Utah Jazz": "UTA",
+    "Washington Wizards": "WAS",
+}
 
 def send_message(text: str) -> None:
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    data = urllib.parse.urlencode({
+    payload = urllib.parse.urlencode({
         "chat_id": CHAT_ID,
-        "text": text,
+        "text": text[:4000],  # Telegram limit de mensaje
     }).encode("utf-8")
 
-    req = urllib.request.Request(url, data=data, method="POST")
+    req = urllib.request.Request(url, data=payload, method="POST")
     with urllib.request.urlopen(req, timeout=30) as response:
-        print(response.read().decode("utf-8"))
+        response.read()
+
+def http_get_json(url: str, headers=None, timeout=30):
+    req = urllib.request.Request(url, headers=headers or {}, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 def get_updates(offset=None):
     url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
@@ -33,232 +124,508 @@ def get_updates(offset=None):
     with urllib.request.urlopen(url, timeout=30) as response:
         return json.loads(response.read().decode("utf-8"))
 
-def get_first_event():
-    url = "https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/events"
-    url += "?" + urllib.parse.urlencode({"apiKey": ODDS_API_KEY})
+def now_ts():
+    return time.time()
 
-    with urllib.request.urlopen(url, timeout=30) as response:
-        events = json.loads(response.read().decode("utf-8"))
-
-    if not events:
+def cache_get(cache: dict, key: str):
+    item = cache.get(key)
+    if not item:
         return None
+    if now_ts() - item["ts"] > CACHE_TTL_SECONDS:
+        cache.pop(key, None)
+        return None
+    return item["data"]
 
-    return events[0]
+def cache_set(cache: dict, key: str, data):
+    cache[key] = {"ts": now_ts(), "data": data}
 
-def get_event_odds(event_id):
-    url = f"https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/events/{event_id}/odds"
+def decimal_implied_prob(price: float) -> float:
+    if not price or price <= 1:
+        return 0.0
+    return 1.0 / price
+
+def clamp(x, low, high):
+    return max(low, min(high, x))
+
+def normal_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def american_season_string():
+    # temporada tipo 2025-26
+    now = datetime.now(timezone.utc)
+    year = now.year
+    month = now.month
+    start_year = year if month >= 9 else year - 1
+    end_year_short = str((start_year + 1) % 100).zfill(2)
+    return f"{start_year}-{end_year_short}"
+
+def get_nba_events():
+    url = f"https://api.the-odds-api.com/v4/sports/{SPORT_KEY}/odds"
     url += "?" + urllib.parse.urlencode({
         "apiKey": ODDS_API_KEY,
-        "regions": "eu,uk,us",
-        "markets": "alternate_totals_corners",
-        "oddsFormat": "decimal"
+        "regions": REGIONS,
+        "markets": "h2h",
+        "oddsFormat": ODDS_FORMAT,
+    })
+    return http_get_json(url)
+
+def get_event_props(event_id: str, market_keys):
+    url = f"https://api.the-odds-api.com/v4/sports/{SPORT_KEY}/events/{event_id}/odds"
+    url += "?" + urllib.parse.urlencode({
+        "apiKey": ODDS_API_KEY,
+        "regions": REGIONS,
+        "markets": ",".join(market_keys),
+        "oddsFormat": ODDS_FORMAT,
+    })
+    return http_get_json(url)
+
+def get_all_players():
+    cached = cache_get(PLAYER_CACHE, "all_players")
+    if cached is not None:
+        return cached
+
+    season = american_season_string()
+    url = "https://stats.nba.com/stats/commonallplayers"
+    url += "?" + urllib.parse.urlencode({
+        "IsOnlyCurrentSeason": "1",
+        "LeagueID": "00",
+        "Season": season,
     })
 
-    with urllib.request.urlopen(url, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8"))
+    data = http_get_json(url, headers=NBA_HEADERS, timeout=30)
+    time.sleep(NBA_REQUEST_SLEEP)
 
-def estimate_probability(line, price, market_type):
-    """
-    Modelo simple pero más sensato:
-    - parte de la probabilidad implícita
-    - ajusta según la línea
-    - ajusta según si es Over o Under
-    """
-    implied = 1 / price
-    estimated = implied + 0.04
+    result_sets = data.get("resultSets", [])
+    if not result_sets:
+        raise RuntimeError("NBA commonallplayers sin datos")
 
-    # Preferimos líneas razonables
-    if line <= 8.5:
-        if market_type == "Over":
-            estimated += 0.03
-        else:
-            estimated -= 0.02
-    elif line == 9.5:
-        estimated += 0.02
-    elif line == 10.5:
-        estimated += 0.00
-    elif line == 11.5:
-        if market_type == "Over":
-            estimated -= 0.04
-        else:
-            estimated += 0.03
-    else:
-        # Penalizamos líneas raras
-        estimated -= 0.03
+    rowset = result_sets[0]["rowSet"]
+    headers = result_sets[0]["headers"]
+    idx = {name: i for i, name in enumerate(headers)}
 
-    estimated = max(0.08, min(estimated, 0.82))
-    return estimated
+    players = []
+    for row in rowset:
+        players.append({
+            "player_id": row[idx["PERSON_ID"]],
+            "display_name": row[idx["DISPLAY_FIRST_LAST"]],
+            "team_id": row[idx["TEAM_ID"]],
+            "team_city": row[idx.get("TEAM_CITY", -1)] if "TEAM_CITY" in idx else "",
+            "team_name": row[idx.get("TEAM_NAME", -1)] if "TEAM_NAME" in idx else "",
+            "team_abbr": row[idx.get("TEAM_ABBREVIATION", -1)] if "TEAM_ABBREVIATION" in idx else "",
+        })
 
-def line_priority_score(line):
-    if line == 9.5:
-        return 5
-    if line == 10.5:
-        return 4
-    if line == 8.5:
-        return 3
-    if line == 11.5:
-        return 2
-    return 0
+    cache_set(PLAYER_CACHE, "all_players", players)
+    return players
 
-def suggested_stake(edge):
-    if edge >= 0.15:
-        return 25
-    if edge >= 0.10:
-        return 20
-    return 15
+def normalize_name(name: str) -> str:
+    return " ".join((name or "").lower().replace(".", "").replace("’", "'").split())
 
-def get_corners_value_message():
+def find_player_by_name_and_team(player_name: str, team_abbr: str = ""):
+    players = get_all_players()
+    target = normalize_name(player_name)
+
+    exact = []
+    partial = []
+
+    for p in players:
+        p_name = normalize_name(p["display_name"])
+        if p_name == target:
+            if not team_abbr or p.get("team_abbr") == team_abbr:
+                exact.append(p)
+        elif target in p_name or p_name in target:
+            if not team_abbr or p.get("team_abbr") == team_abbr:
+                partial.append(p)
+
+    if exact:
+        return exact[0]
+    if partial:
+        return partial[0]
+    return None
+
+def get_player_game_log(player_id: int):
+    cache_key = f"gamelog_{player_id}"
+    cached = cache_get(GAMELOG_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
+    season = american_season_string()
+    url = "https://stats.nba.com/stats/playergamelog"
+    url += "?" + urllib.parse.urlencode({
+        "DateFrom": "",
+        "DateTo": "",
+        "LeagueID": "00",
+        "PlayerID": str(player_id),
+        "Season": season,
+        "SeasonType": "Regular Season",
+    })
+
+    data = http_get_json(url, headers=NBA_HEADERS, timeout=30)
+    time.sleep(NBA_REQUEST_SLEEP)
+
+    result_sets = data.get("resultSets", [])
+    if not result_sets:
+        raise RuntimeError("NBA playergamelog sin datos")
+
+    rowset = result_sets[0]["rowSet"]
+    headers = result_sets[0]["headers"]
+    idx = {name: i for i, name in enumerate(headers)}
+
+    games = []
+    for row in rowset:
+        games.append({
+            "GAME_DATE": row[idx["GAME_DATE"]],
+            "MATCHUP": row[idx["MATCHUP"]],
+            "MIN": safe_float(row[idx["MIN"]]),
+            "PTS": safe_float(row[idx["PTS"]]),
+            "REB": safe_float(row[idx["REB"]]),
+            "AST": safe_float(row[idx["AST"]]),
+            "FG3M": safe_float(row[idx["FG3M"]]),
+        })
+
+    cache_set(GAMELOG_CACHE, cache_key, games)
+    return games
+
+def safe_float(value):
     try:
-        event = get_first_event()
-        if not event:
-            return "No encontré eventos"
+        return float(value)
+    except Exception:
+        return 0.0
 
-        home = event.get("home_team", "Local")
-        away = event.get("away_team", "Visitante")
+def get_team_abbr(full_team_name: str) -> str:
+    return TEAM_NAME_TO_ABBR.get(full_team_name, "")
 
-        odds_data = get_event_odds(event.get("id"))
-        bookmakers = odds_data.get("bookmakers", [])
+def weighted_mean(values, weights):
+    if not values or not weights or len(values) != len(weights):
+        return 0.0
+    s_w = sum(weights)
+    if s_w <= 0:
+        return 0.0
+    return sum(v * w for v, w in zip(values, weights)) / s_w
 
-        if not bookmakers:
-            return "No hay cuotas disponibles"
+def sample_std(values):
+    if len(values) < 2:
+        return 0.0
+    m = sum(values) / len(values)
+    variance = sum((x - m) ** 2 for x in values) / (len(values) - 1)
+    return math.sqrt(variance)
 
-        best_pick = None
+def compute_prop_model(games, stat_key, opponent_abbr=None):
+    if not games:
+        return None
 
-        for book in bookmakers:
-            book_name = book.get("title", "Bookmaker")
+    last_10 = games[:10]
+    last_5 = games[:5]
+    if len(last_10) < 4:
+        return None
 
-            for market in book.get("markets", []):
-                if market.get("key") != "alternate_totals_corners":
+    vals_10 = [g[stat_key] for g in last_10]
+    mins_10 = [g["MIN"] for g in last_10]
+    avg10 = sum(vals_10) / len(vals_10)
+    avg5 = sum(g[stat_key] for g in last_5) / len(last_5) if last_5 else avg10
+    avg_min = sum(mins_10) / len(mins_10)
+
+    opp_games = []
+    if opponent_abbr:
+        opp_games = [g for g in games[:15] if opponent_abbr in (g["MATCHUP"] or "")]
+    opp_avg = None
+    if len(opp_games) >= 2:
+        opp_avg = sum(g[stat_key] for g in opp_games) / len(opp_games)
+
+    base = weighted_mean(
+        [avg5, avg10, opp_avg if opp_avg is not None else avg10],
+        [0.45, 0.40, 0.15]
+    )
+
+    # Ajuste por minutos
+    minute_factor = 1.0
+    if avg_min >= 36:
+        minute_factor += 0.04
+    elif avg_min >= 32:
+        minute_factor += 0.02
+    elif avg_min < 24:
+        minute_factor -= 0.07
+    elif avg_min < 28:
+        minute_factor -= 0.03
+
+    projection = base * minute_factor
+    stdev = sample_std(vals_10)
+    if stdev < 1.5:
+        stdev = 1.5
+
+    hit_rate_10 = sum(1 for v in vals_10 if v > 0) / len(vals_10)
+
+    return {
+        "avg5": avg5,
+        "avg10": avg10,
+        "opp_avg": opp_avg,
+        "avg_min": avg_min,
+        "projection": projection,
+        "stdev": stdev,
+        "hit_rate_10": hit_rate_10,
+        "games_used": len(last_10),
+    }
+
+def probability_over(line: float, projection: float, stdev: float) -> float:
+    # Aproximación continua con corrección de medio punto
+    z = ((line + 0.5) - projection) / stdev
+    return 1.0 - normal_cdf(z)
+
+def probability_under(line: float, projection: float, stdev: float) -> float:
+    return 1.0 - probability_over(line, projection, stdev)
+
+def stake_from_edge(edge: float) -> int:
+    if edge >= 0.18:
+        return 30
+    if edge >= 0.12:
+        return 20
+    if edge >= 0.08:
+        return 15
+    return 10
+
+def extract_best_props_for_event(event):
+    event_id = event["id"]
+    home = event.get("home_team", "")
+    away = event.get("away_team", "")
+    home_abbr = get_team_abbr(home)
+    away_abbr = get_team_abbr(away)
+
+    props_data = get_event_props(event_id, list(MARKETS.keys()))
+    bookmakers = props_data.get("bookmakers", [])
+    if not bookmakers:
+        return []
+
+    candidates = []
+
+    for book in bookmakers:
+        book_name = book.get("title", "Bookmaker")
+
+        for market in book.get("markets", []):
+            market_key = market.get("key")
+            if market_key not in MARKETS:
+                continue
+
+            market_meta = MARKETS[market_key]
+            stat_key = market_meta["stat_key"]
+
+            for outcome in market.get("outcomes", []):
+                name = outcome.get("name")          # Over / Under
+                line = outcome.get("point")
+                price = outcome.get("price")
+                desc = outcome.get("description", "")  # suele traer nombre del jugador
+
+                if name not in ("Over", "Under"):
+                    continue
+                if not desc or line is None or not isinstance(price, (int, float)):
+                    continue
+                if price < MIN_PRICE or price > MAX_PRICE:
                     continue
 
-                for outcome in market.get("outcomes", []):
-                    market_type = outcome.get("name")  # Over o Under
+                guessed_team = home_abbr
+                opponent = away_abbr
 
-                    if market_type not in ["Over", "Under"]:
-                        continue
+                # Intento simple de resolver por nombre y equipo
+                player = find_player_by_name_and_team(desc, home_abbr)
+                if player is None:
+                    player = find_player_by_name_and_team(desc, away_abbr)
+                    guessed_team = away_abbr
+                    opponent = home_abbr
 
-                    line = outcome.get("point")
-                    price = outcome.get("price")
+                if player is None:
+                    continue
 
-                    if not isinstance(price, (int, float)) or line is None:
-                        continue
+                try:
+                    games = get_player_game_log(player["player_id"])
+                except Exception:
+                    continue
 
-                    try:
-                        line = float(line)
-                    except Exception:
-                        continue
+                model = compute_prop_model(games, stat_key, opponent_abbr=opponent)
+                if not model:
+                    continue
+                if model["avg_min"] < MIN_AVG_MINUTES:
+                    continue
 
-                    if line > MAX_LINE or line not in PREFERRED_LINES:
-                        continue
+                if name == "Over":
+                    est_prob = probability_over(float(line), model["projection"], model["stdev"])
+                else:
+                    est_prob = probability_under(float(line), model["projection"], model["stdev"])
 
-                    implied = 1 / price
-                    estimated = estimate_probability(line, price, market_type)
-                    edge = (estimated * price) - 1
-                    priority = line_priority_score(line)
+                implied = decimal_implied_prob(float(price))
+                edge = est_prob * float(price) - 1.0
 
-                    if edge < MIN_EDGE:
-                        continue
+                if edge < MIN_EDGE:
+                    continue
 
-                    candidate = {
-                        "book": book_name,
-                        "type": market_type,
-                        "line": line,
-                        "price": price,
-                        "edge": edge,
-                        "implied": implied,
-                        "estimated": estimated,
-                        "priority": priority
-                    }
+                candidates.append({
+                    "event": f"{away} vs {home}",
+                    "book": book_name,
+                    "market_key": market_key,
+                    "market_label": market_meta["label"],
+                    "emoji": market_meta["emoji"],
+                    "player_name": player["display_name"],
+                    "team_abbr": guessed_team,
+                    "opponent_abbr": opponent,
+                    "bet_type": name,
+                    "line": float(line),
+                    "price": float(price),
+                    "implied": implied,
+                    "estimated": est_prob,
+                    "edge": edge,
+                    "avg5": model["avg5"],
+                    "avg10": model["avg10"],
+                    "opp_avg": model["opp_avg"],
+                    "avg_min": model["avg_min"],
+                    "projection": model["projection"],
+                    "stdev": model["stdev"],
+                })
 
-                    if best_pick is None:
-                        best_pick = candidate
-                    else:
-                        # Primero priorizamos líneas mejores, luego edge
-                        if (
-                            candidate["priority"] > best_pick["priority"]
-                            or (
-                                candidate["priority"] == best_pick["priority"]
-                                and candidate["edge"] > best_pick["edge"]
-                            )
-                        ):
-                            best_pick = candidate
+    candidates.sort(key=lambda x: (x["edge"], x["estimated"], x["avg_min"]), reverse=True)
+    return candidates[:MAX_RESULTS]
 
-        if not best_pick:
-            return "No encontré value ahora mismo"
+def get_best_nba_value_message():
+    try:
+        events = get_nba_events()
+        if not events:
+            return "No encontré partidos NBA ahora mismo."
 
-        stake = suggested_stake(best_pick["edge"])
+        all_candidates = []
 
-        return (
-            f"🔥 VALUE DETECTADO\n\n"
-            f"Partido: {home} vs {away}\n"
-            f"Casa: {best_pick['book']}\n\n"
-            f"Mercado: {best_pick['type']} córners\n"
-            f"Línea: {best_pick['line']}\n"
-            f"Cuota: {best_pick['price']}\n\n"
-            f"Prob. implícita: {best_pick['implied']:.1%}\n"
-            f"Prob. estimada: {best_pick['estimated']:.1%}\n"
-            f"Edge: {best_pick['edge']:.1%}\n\n"
-            f"Stake: {stake}€\n\n"
-            f"⚠️ Modelo basado solo en cuotas"
+        for event in events[:4]:  # limita peticiones
+            try:
+                picks = extract_best_props_for_event(event)
+                all_candidates.extend(picks)
+            except Exception as e:
+                print("event error:", e)
+                continue
+
+        if not all_candidates:
+            return "No encontré value ahora mismo en NBA."
+
+        all_candidates.sort(key=lambda x: (x["edge"], x["estimated"], x["avg_min"]), reverse=True)
+        best = all_candidates[0]
+        stake = stake_from_edge(best["edge"])
+
+        opp_avg_text = (
+            f"{best['opp_avg']:.2f}" if best["opp_avg"] is not None else "n/d"
         )
 
+        return (
+            f"🔥 VALUE NBA DETECTADO\n\n"
+            f"Partido: {best['event']}\n"
+            f"Casa: {best['book']}\n\n"
+            f"{best['emoji']} Jugador: {best['player_name']} ({best['team_abbr']})\n"
+            f"Mercado: {best['market_label']}\n"
+            f"Apuesta: {best['bet_type']} {best['line']}\n"
+            f"Cuota: {best['price']:.2f}\n\n"
+            f"Media L5: {best['avg5']:.2f}\n"
+            f"Media L10: {best['avg10']:.2f}\n"
+            f"Vs rival: {opp_avg_text}\n"
+            f"Minutos medios: {best['avg_min']:.1f}\n"
+            f"Proyección: {best['projection']:.2f}\n\n"
+            f"Prob. implícita: {best['implied']:.1%}\n"
+            f"Prob. estimada: {best['estimated']:.1%}\n"
+            f"Edge: {best['edge']:.1%}\n"
+            f"Stake sugerido: {stake}€\n\n"
+            f"⚠️ Modelo simple: usa líneas de The Odds API + game log oficial NBA"
+        )
     except Exception as e:
-        return f"Error ❌ {e}"
+        return f"Error NBA value ❌ {e}"
 
-def get_corners_odds_message():
+def get_nba_props_board_message():
     try:
-        event = get_first_event()
-        if not event:
-            return "No encontré eventos"
+        events = get_nba_events()
+        if not events:
+            return "No encontré partidos NBA."
 
+        event = events[0]
         home = event.get("home_team", "Local")
         away = event.get("away_team", "Visitante")
 
-        odds_data = get_event_odds(event.get("id"))
-        bookmakers = odds_data.get("bookmakers", [])
-
+        props_data = get_event_props(event["id"], list(MARKETS.keys()))
+        bookmakers = props_data.get("bookmakers", [])
         if not bookmakers:
-            return "No hay cuotas disponibles"
+            return "No hay props disponibles ahora mismo."
 
-        mensaje = f"🚩 Cuotas de córners\n\n{home} vs {away}\n\n"
+        msg = f"📋 Props NBA\n\n{away} vs {home}\n\n"
+        shown = 0
 
-        found = False
-
-        for book in bookmakers[:3]:
-            mensaje += f"🏪 {book.get('title', 'Bookmaker')}\n"
+        for book in bookmakers[:2]:
+            msg += f"🏪 {book.get('title', 'Bookmaker')}\n"
+            per_book = 0
 
             for market in book.get("markets", []):
-                if market.get("key") != "alternate_totals_corners":
+                mk = market.get("key")
+                if mk not in MARKETS:
                     continue
 
-                for outcome in market.get("outcomes", []):
-                    name = outcome.get("name")
+                market_label = MARKETS[mk]["label"]
+                for outcome in market.get("outcomes", [])[:8]:
+                    desc = outcome.get("description", "")
+                    name = outcome.get("name", "")
                     point = outcome.get("point")
                     price = outcome.get("price")
 
-                    try:
-                        point = float(point)
-                    except Exception:
+                    if not desc or name not in ("Over", "Under") or point is None:
                         continue
 
-                    if point in PREFERRED_LINES and name in ["Over", "Under"]:
-                        found = True
-                        mensaje += f"{name} {point} → {price}\n"
+                    msg += f"{market_label} | {desc} | {name} {point} @ {price}\n"
+                    per_book += 1
+                    shown += 1
 
-            mensaje += "\n"
+                    if per_book >= 10:
+                        break
 
-        if not found:
-            return "No encontré líneas útiles de córners"
+                if per_book >= 10:
+                    break
 
-        return mensaje
+            msg += "\n"
 
+        if shown == 0:
+            return "No encontré props útiles."
+
+        return msg[:4000]
     except Exception as e:
-        return f"Error cuotas ❌ {e}"
+        return f"Error props ❌ {e}"
+
+def get_nba_player_message(player_name: str):
+    try:
+        if not player_name.strip():
+            return "Uso: /nba_player Nombre Apellido"
+
+        player = find_player_by_name_and_team(player_name)
+        if player is None:
+            return f"No encontré al jugador: {player_name}"
+
+        games = get_player_game_log(player["player_id"])
+        if not games:
+            return f"No hay game log para {player['display_name']}"
+
+        last_5 = games[:5]
+        avg_min = sum(g["MIN"] for g in last_5) / len(last_5)
+        avg_pts = sum(g["PTS"] for g in last_5) / len(last_5)
+        avg_reb = sum(g["REB"] for g in last_5) / len(last_5)
+        avg_ast = sum(g["AST"] for g in last_5) / len(last_5)
+        avg_3pm = sum(g["FG3M"] for g in last_5) / len(last_5)
+
+        lines = "\n".join(
+            f"{g['GAME_DATE']} | {g['MATCHUP']} | MIN {g['MIN']:.0f} | "
+            f"PTS {g['PTS']:.0f} | REB {g['REB']:.0f} | AST {g['AST']:.0f} | 3PM {g['FG3M']:.0f}"
+            for g in last_5
+        )
+
+        return (
+            f"👤 {player['display_name']} ({player.get('team_abbr', '')})\n\n"
+            f"Media últimos 5:\n"
+            f"MIN {avg_min:.1f} | PTS {avg_pts:.1f} | REB {avg_reb:.1f} | "
+            f"AST {avg_ast:.1f} | 3PM {avg_3pm:.1f}\n\n"
+            f"Últimos partidos:\n{lines}"
+        )
+    except Exception as e:
+        return f"Error jugador ❌ {e}"
 
 def heartbeat():
     while True:
         try:
-            time.sleep(300)
+            time.sleep(600)
             send_message("Sigo activo ✅")
         except Exception:
             time.sleep(30)
@@ -278,32 +645,40 @@ def command_loop():
                 offset = update_id + 1
 
                 message = item.get("message", {})
-                text = message.get("text", "")
+                text = (message.get("text", "") or "").strip()
 
                 if text == "/start":
                     send_message(
-                        "🤖 Bot listo.\n"
+                        "🤖 Bot NBA listo.\n\n"
                         "Comandos:\n"
                         "/ping\n"
-                        "/corners_cuotas\n"
-                        "/corners_value"
+                        "/nba_props\n"
+                        "/nba_value\n"
+                        "/nba_player Nombre Apellido"
                     )
 
                 elif text == "/ping":
                     send_message("pong 🟢")
 
-                elif text == "/corners_cuotas":
-                    send_message(get_corners_odds_message())
+                elif text == "/nba_props":
+                    send_message(get_nba_props_board_message())
 
-                elif text == "/corners_value":
-                    send_message(get_corners_value_message())
+                elif text == "/nba_value":
+                    send_message(get_best_nba_value_message())
+
+                elif text.startswith("/nba_player"):
+                    player_name = text.replace("/nba_player", "", 1).strip()
+                    send_message(get_nba_player_message(player_name))
 
         except Exception as e:
             print("loop error:", e)
             time.sleep(5)
 
 def main():
-    send_message("🔥 Bot PRO córners iniciado 🔥")
+    if not TOKEN or not CHAT_ID or not ODDS_API_KEY:
+        raise RuntimeError("Faltan variables: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ODDS_API_KEY")
+
+    send_message("🔥 Bot NBA Props iniciado 🔥")
 
     t1 = threading.Thread(target=heartbeat, daemon=True)
     t2 = threading.Thread(target=command_loop, daemon=True)
