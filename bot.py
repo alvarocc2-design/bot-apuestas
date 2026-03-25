@@ -82,7 +82,7 @@ def command_loop():
                 text = message.get("text", "")
 
                 if text == "/start":
-                    send_message("🤖 Bot conectado. Comandos: /ping /status /test_odds /test_football")
+                    send_message("🤖 Bot conectado. Comandos: /ping /status /test_odds /test_football /liga /partidos")
                 elif text == "/ping":
                     send_message("pong 🟢")
                 elif text == "/status":
@@ -91,6 +91,30 @@ def command_loop():
                     send_message(test_odds_api())
                 elif text == "/test_football":
                     send_message(test_football_api())
+                elif text == "/liga":
+                    send_message("Comando /liga detectado ✅")
+                elif text == "/partidos":
+                    try:
+                        url = "https://api.the-odds-api.com/v4/sports/soccer_spain_la_liga/events"
+                        url += "?" + urllib.parse.urlencode({"apiKey": ODDS_API_KEY})
+
+                        with urllib.request.urlopen(url, timeout=30) as response:
+                            data_events = json.loads(response.read().decode("utf-8"))
+
+                        if not data_events:
+                            send_message("No hay partidos disponibles")
+                            continue
+
+                        mensaje = "📊 Próximos partidos:\n\n"
+                        for partido in data_events[:5]:
+                            home = partido.get("home_team", "Local")
+                            away = partido.get("away_team", "Visitante")
+                            mensaje += f"{home} vs {away}\n"
+
+                        send_message(mensaje)
+
+                    except Exception as e:
+                        send_message(f"Error partidos ❌ {e}")
 
         except Exception as e:
             print("command_loop error:", e)
