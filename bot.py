@@ -14,10 +14,46 @@ API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
 
 BANKROLL = 1000
 MIN_EDGE = 0.08
-LEAGUE_ID = 140
 
 CURRENT_YEAR = datetime.now(timezone.utc).year
 SEASONS_TO_TRY = [CURRENT_YEAR, CURRENT_YEAR - 1]
+
+# [No verificado] Ajusta sport_key / league_id si tu proveedor usa otro valor
+LEAGUES = {
+    "laliga": {
+        "name": "LaLiga EA Sports",
+        "odds_sport_key": "soccer_spain_la_liga",
+        "football_league_id": 140,
+    },
+    "hypermotion": {
+        "name": "LaLiga Hypermotion",
+        "odds_sport_key": "soccer_spain_segunda_division",
+        "football_league_id": 141,
+    },
+    "premier": {
+        "name": "Premier League",
+        "odds_sport_key": "soccer_epl",
+        "football_league_id": 39,
+    },
+    "serie_a": {
+        "name": "Serie A",
+        "odds_sport_key": "soccer_italy_serie_a",
+        "football_league_id": 135,
+    },
+    "bundesliga": {
+        "name": "Bundesliga",
+        "odds_sport_key": "soccer_germany_bundesliga",
+        "football_league_id": 78,
+    },
+    "ligue_1": {
+        "name": "Ligue 1",
+        "odds_sport_key": "soccer_france_ligue_one",
+        "football_league_id": 61,
+    },
+}
+
+ACTIVE_LEAGUE = "hypermotion"
+
 
 def send_message(text: str) -> None:
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -29,6 +65,7 @@ def send_message(text: str) -> None:
     with urllib.request.urlopen(req, timeout=30) as response:
         print(response.read().decode("utf-8"))
 
+
 def get_updates(offset=None):
     url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
     if offset is not None:
@@ -36,12 +73,14 @@ def get_updates(offset=None):
     with urllib.request.urlopen(url, timeout=30) as response:
         return json.loads(response.read().decode("utf-8"))
 
+
 def normalize_text(text: str) -> str:
     text = (text or "").lower().strip()
     text = unicodedata.normalize("NFD", text)
     text = "".join(c for c in text if unicodedata.category(c) != "Mn")
     text = text.replace(".", " ").replace("-", " ").replace("'", " ")
     return " ".join(text.split())
+
 
 def football_get(path: str, params: dict):
     url = f"https://v3.football.api-sports.io{path}"
@@ -51,11 +90,48 @@ def football_get(path: str, params: dict):
     with urllib.request.urlopen(req, timeout=30) as response:
         return json.loads(response.read().decode("utf-8"))
 
+
 def odds_get(path: str, params: dict):
     url = f"https://api.the-odds-api.com/v4{path}"
     url += "?" + urllib.parse.urlencode(params)
     with urllib.request.urlopen(url, timeout=30) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def current_league_config():
+    return LEAGUES[ACTIVE_LEAGUE]
+
+
+def current_sport_key():
+    return current_league_config()["odds_sport_key"]
+
+
+def current_football_league_id():
+    return current_league_config()["football_league_id"]
+
+
+def current_league_name():
+    return current_league_config()["name"]
+
+
+def list_leagues_message():
+    lines = [f"🏆 Liga activa: {ACTIVE_LEAGUE} ({current_league_name()})", "", "Ligas disponibles:"]
+    for key, cfg in LEAGUES.items():
+        marker = "✅" if key == ACTIVE_LEAGUE else "•"
+        lines.append(f"{marker} {key} → {cfg['name']}")
+    lines.append("")
+    lines.append("Usa: /setliga <clave>")
+    return "\n".join(lines)
+
+
+def set_active_league(key: str):
+    global ACTIVE_LEAGUE
+    key = (key or "").strip().lower()
+    if key not in LEAGUES:
+        return False, f"Liga no válida: {key}"
+    ACTIVE_LEAGUE = key
+    return True, f"✅ Liga cambiada a {key} ({current_league_name()})"
+
 
 def test_odds_api() -> str:
     if not ODDS_API_KEY:
@@ -68,6 +144,7 @@ def test_odds_api() -> str:
     except Exception as e:
         return f"ODDS API ERROR ❌ {e}"
 
+
 def test_football_api() -> str:
     if not API_FOOTBALL_KEY:
         return "Falta API_FOOTBALL_KEY"
@@ -79,6 +156,7 @@ def test_football_api() -> str:
     except Exception as e:
         return f"API-FOOTBALL ERROR ❌ {e}"
 
+
 def pick_stake(edge: float) -> float:
     if edge >= 0.15:
         return 25
@@ -86,18 +164,20 @@ def pick_stake(edge: float) -> float:
         return 20
     return 15
 
-def get_first_laliga_event():
+
+def get_first_event():
     events = odds_get(
-        "/sports/soccer_spain_la_liga/events",
+        f"/sports/{current_sport_key()}/events",
         {"apiKey": ODDS_API_KEY}
     )
     if not events:
         return None
     return events[0]
 
+
 def get_event_odds(event_id: str):
     return odds_get(
-        f"/sports/soccer_spain_la_liga/events/{event_id}/odds",
+        f"/sports/{current_sport_key()}/events/{event_id}/odds",
         {
             "apiKey": ODDS_API_KEY,
             "regions": "us,us2",
@@ -106,10 +186,12 @@ def get_event_odds(event_id: str):
         }
     )
 
+
 def team_names_match(a: str, b: str) -> bool:
     na = normalize_text(a)
     nb = normalize_text(b)
     return na == nb or na in nb or nb in na
+
 
 def get_dates_to_try(event):
     raw = event.get("commence_time")
@@ -131,6 +213,7 @@ def get_dates_to_try(event):
 
     return [d.isoformat() for d in dates]
 
+
 def get_matching_fixture_for_event(event):
     try:
         home = event.get("home_team", "")
@@ -139,7 +222,7 @@ def get_matching_fixture_for_event(event):
         for season in SEASONS_TO_TRY:
             for date_str in get_dates_to_try(event):
                 data = football_get("/fixtures", {
-                    "league": LEAGUE_ID,
+                    "league": current_football_league_id(),
                     "season": season,
                     "date": date_str
                 })
@@ -164,6 +247,7 @@ def get_matching_fixture_for_event(event):
         print("get_matching_fixture_for_event error:", e)
         return None
 
+
 def get_team_squad(team_id: int):
     try:
         data = football_get("/players/squads", {"team": team_id})
@@ -174,6 +258,7 @@ def get_team_squad(team_id: int):
     except Exception as e:
         print("get_team_squad error:", e)
         return []
+
 
 def resolve_player_id_from_event_player(name: str, event) -> int | None:
     norm_target = normalize_text(name)
@@ -216,8 +301,9 @@ def resolve_player_id_from_event_player(name: str, event) -> int | None:
 
     return None
 
+
 def get_player_stats(player_name):
-    event = get_first_laliga_event()
+    event = get_first_event()
     if not event:
         return "No encontré evento para resolver el jugador"
 
@@ -271,9 +357,10 @@ def get_player_stats(player_name):
     except Exception as e:
         return f"Error stats ❌ {e}"
 
+
 def get_match_odds_message() -> str:
     try:
-        event = get_first_laliga_event()
+        event = get_first_event()
         if not event:
             return "No encontré eventos."
 
@@ -287,7 +374,7 @@ def get_match_odds_message() -> str:
         if not bookmakers:
             return f"No encontré cuotas para {home} vs {away}"
 
-        mensaje = f"💰 Cuotas para:\n{home} vs {away}\n\n"
+        mensaje = f"💰 Cuotas para:\n{home} vs {away}\nLiga: {current_league_name()}\n\n"
         found_any = False
 
         for book in bookmakers[:2]:
@@ -314,8 +401,9 @@ def get_match_odds_message() -> str:
     except Exception as e:
         return f"Error cuotas ❌ {e}"
 
+
 def get_first_player_from_props():
-    event = get_first_laliga_event()
+    event = get_first_event()
     if not event:
         return None
 
@@ -330,22 +418,23 @@ def get_first_player_from_props():
 
     return None
 
+
 def get_debug_fixture_message():
     try:
-        event = get_first_laliga_event()
+        event = get_first_event()
         if not event:
             return "No encontré evento"
 
         home = event.get("home_team", "")
         away = event.get("away_team", "")
-        mensaje = f"🔎 DEBUG FIXTURE\n\nOdds API:\n{home} vs {away}\n\n"
+        mensaje = f"🔎 DEBUG FIXTURE\n\nLiga activa: {ACTIVE_LEAGUE} ({current_league_name()})\n\nOdds API:\n{home} vs {away}\n\n"
 
         found_any = False
 
         for season in SEASONS_TO_TRY:
             for date_str in get_dates_to_try(event):
                 data = football_get("/fixtures", {
-                    "league": LEAGUE_ID,
+                    "league": current_football_league_id(),
                     "season": season,
                     "date": date_str
                 })
@@ -368,9 +457,10 @@ def get_debug_fixture_message():
     except Exception as e:
         return f"Error debug_fixture ❌ {e}"
 
+
 def get_debug_squad_message():
     try:
-        event = get_first_laliga_event()
+        event = get_first_event()
         if not event:
             return "No encontré evento"
 
@@ -398,14 +488,16 @@ def get_debug_squad_message():
     except Exception as e:
         return f"Error debug_squad ❌ {e}"
 
+
 def test_probability_from_odds(price: float) -> float:
     implied = 1 / price
     boosted = implied + 0.10
     return min(boosted, 0.85)
 
+
 def get_value_message() -> str:
     try:
-        event = get_first_laliga_event()
+        event = get_first_event()
         if not event:
             return "No encontré eventos para analizar."
 
@@ -447,6 +539,7 @@ def get_value_message() -> str:
 
                         return (
                             f"🔥 VALUE DETECTADO\n\n"
+                            f"Liga: {current_league_name()}\n"
                             f"Partido: {home} vs {away}\n"
                             f"Casa: {book_name}\n\n"
                             f"Jugador: {jugador}\n"
@@ -468,6 +561,7 @@ def get_value_message() -> str:
     except Exception as e:
         return f"Error value ❌ {e}"
 
+
 def stats_command():
     try:
         jugador = get_first_player_from_props()
@@ -479,6 +573,7 @@ def stats_command():
     except Exception as e:
         return f"Error stats ❌ {e}"
 
+
 def heartbeat():
     while True:
         try:
@@ -488,7 +583,10 @@ def heartbeat():
             print("heartbeat error:", e)
             time.sleep(30)
 
+
 def command_loop():
+    global ACTIVE_LEAGUE
+
     offset = None
     while True:
         try:
@@ -502,32 +600,54 @@ def command_loop():
                 offset = update_id + 1
 
                 message = item.get("message", {})
-                text = message.get("text", "")
+                text = (message.get("text", "") or "").strip()
 
                 if text == "/start":
-                    send_message("🤖 Bot conectado. Comandos: /ping /status /test_odds /test_football /liga /partidos /cuotas /value /stats /debug_fixture /debug_squad")
+                    send_message(
+                        "🤖 Bot conectado.\n"
+                        "Comandos:\n"
+                        "/ligas\n"
+                        "/setliga <clave>\n"
+                        "/ping\n"
+                        "/status\n"
+                        "/test_odds\n"
+                        "/test_football\n"
+                        "/partidos\n"
+                        "/cuotas\n"
+                        "/value\n"
+                        "/stats\n"
+                        "/debug_fixture\n"
+                        "/debug_squad"
+                    )
                 elif text == "/ping":
                     send_message("pong 🟢")
                 elif text == "/status":
-                    send_message("Estado actual: bot estable, Telegram OK, modo seguro activado.")
+                    send_message(f"Estado actual: bot estable, Telegram OK.\nLiga activa: {ACTIVE_LEAGUE} ({current_league_name()})")
+                elif text == "/ligas":
+                    send_message(list_leagues_message())
+                elif text.startswith("/setliga"):
+                    parts = text.split(maxsplit=1)
+                    if len(parts) < 2:
+                        send_message("Uso: /setliga <clave>")
+                    else:
+                        ok, msg = set_active_league(parts[1])
+                        send_message(msg)
                 elif text == "/test_odds":
                     send_message(test_odds_api())
                 elif text == "/test_football":
                     send_message(test_football_api())
-                elif text == "/liga":
-                    send_message("Comando /liga detectado ✅")
                 elif text == "/partidos":
                     try:
                         events = odds_get(
-                            "/sports/soccer_spain_la_liga/events",
+                            f"/sports/{current_sport_key()}/events",
                             {"apiKey": ODDS_API_KEY}
                         )
 
                         if not events:
-                            send_message("No hay partidos disponibles")
+                            send_message(f"No hay partidos disponibles en {current_league_name()}")
                             continue
 
-                        mensaje = "📊 Próximos partidos:\n\n"
+                        mensaje = f"📊 Próximos partidos ({current_league_name()}):\n\n"
                         for partido in events[:5]:
                             home = partido.get("home_team", "Local")
                             away = partido.get("away_team", "Visitante")
@@ -552,8 +672,9 @@ def command_loop():
             print("command_loop error:", e)
             time.sleep(5)
 
+
 def main():
-    send_message("🔥 Bot PRO iniciando 🔥")
+    send_message(f"🔥 Bot PRO iniciando 🔥\nLiga activa: {ACTIVE_LEAGUE} ({current_league_name()})")
     t1 = threading.Thread(target=heartbeat, daemon=True)
     t2 = threading.Thread(target=command_loop, daemon=True)
     t1.start()
@@ -561,6 +682,7 @@ def main():
 
     while True:
         time.sleep(60)
+
 
 if __name__ == "__main__":
     main()
