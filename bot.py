@@ -5,6 +5,7 @@ import json
 import urllib.request
 import urllib.parse
 import unicodedata
+from datetime import datetime, timedelta, timezone
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -14,7 +15,9 @@ API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
 BANKROLL = 1000
 MIN_EDGE = 0.08
 LEAGUE_ID = 140
-SEASON = 2024
+
+CURRENT_YEAR = datetime.now(timezone.utc).year
+SEASONS_TO_TRY = [CURRENT_YEAR, CURRENT_YEAR - 1]
 
 def send_message(text: str) -> None:
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -108,33 +111,55 @@ def team_names_match(a: str, b: str) -> bool:
     nb = normalize_text(b)
     return na == nb or na in nb or nb in na
 
+def get_dates_to_try(event):
+    raw = event.get("commence_time")
+    dates = []
+
+    if raw:
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            dates.append(dt.date())
+            dates.append((dt - timedelta(days=1)).date())
+            dates.append((dt + timedelta(days=1)).date())
+        except Exception:
+            pass
+
+    today = datetime.now(timezone.utc).date()
+    for d in [today - timedelta(days=1), today, today + timedelta(days=1)]:
+        if d not in dates:
+            dates.append(d)
+
+    return [d.isoformat() for d in dates]
+
 def get_matching_fixture_for_event(event):
     try:
-        event_date = (event.get("commence_time") or "")[:10]
         home = event.get("home_team", "")
         away = event.get("away_team", "")
 
-        data = football_get("/fixtures", {
-            "league": LEAGUE_ID,
-            "season": SEASON,
-            "date": event_date
-        })
+        for season in SEASONS_TO_TRY:
+            for date_str in get_dates_to_try(event):
+                data = football_get("/fixtures", {
+                    "league": LEAGUE_ID,
+                    "season": season,
+                    "date": date_str
+                })
 
-        fixtures = data.get("response", [])
+                fixtures = data.get("response", [])
 
-        for f in fixtures:
-            home_name = f.get("teams", {}).get("home", {}).get("name", "")
-            away_name = f.get("teams", {}).get("away", {}).get("name", "")
-            if team_names_match(home, home_name) and team_names_match(away, away_name):
-                return f
+                for f in fixtures:
+                    home_name = f.get("teams", {}).get("home", {}).get("name", "")
+                    away_name = f.get("teams", {}).get("away", {}).get("name", "")
+                    if team_names_match(home, home_name) and team_names_match(away, away_name):
+                        return f
 
-        for f in fixtures:
-            home_name = f.get("teams", {}).get("home", {}).get("name", "")
-            away_name = f.get("teams", {}).get("away", {}).get("name", "")
-            if team_names_match(home, home_name) or team_names_match(away, away_name):
-                return f
+                for f in fixtures:
+                    home_name = f.get("teams", {}).get("home", {}).get("name", "")
+                    away_name = f.get("teams", {}).get("away", {}).get("name", "")
+                    if team_names_match(home, home_name) or team_names_match(away, away_name):
+                        return f
 
         return None
+
     except Exception as e:
         print("get_matching_fixture_for_event error:", e)
         return None
@@ -201,15 +226,22 @@ def get_player_stats(player_name):
         return f"No encontré ID para {player_name}"
 
     try:
-        data = football_get("/players", {
-            "id": player_id,
-            "season": SEASON
-        })
+        found = None
 
-        if not data.get("response"):
+        for season in SEASONS_TO_TRY:
+            data = football_get("/players", {
+                "id": player_id,
+                "season": season
+            })
+
+            if data.get("response"):
+                found = data
+                break
+
+        if not found or not found.get("response"):
             return f"No encontré estadísticas para {player_name}"
 
-        stats_blocks = data["response"][0].get("statistics", [])
+        stats_blocks = found["response"][0].get("statistics", [])
         if not stats_blocks:
             return f"No encontré estadísticas para {player_name}"
 
@@ -297,6 +329,44 @@ def get_first_player_from_props():
                     return outcomes[0].get("description")
 
     return None
+
+def get_debug_fixture_message():
+    try:
+        event = get_first_laliga_event()
+        if not event:
+            return "No encontré evento"
+
+        home = event.get("home_team", "")
+        away = event.get("away_team", "")
+        mensaje = f"🔎 DEBUG FIXTURE\n\nOdds API:\n{home} vs {away}\n\n"
+
+        found_any = False
+
+        for season in SEASONS_TO_TRY:
+            for date_str in get_dates_to_try(event):
+                data = football_get("/fixtures", {
+                    "league": LEAGUE_ID,
+                    "season": season,
+                    "date": date_str
+                })
+
+                fixtures = data.get("response", [])
+                if fixtures:
+                    found_any = True
+                    mensaje += f"Temporada {season} | Fecha {date_str}\n"
+                    for f in fixtures[:5]:
+                        h = f.get("teams", {}).get("home", {}).get("name", "")
+                        a = f.get("teams", {}).get("away", {}).get("name", "")
+                        mensaje += f"- {h} vs {a}\n"
+                    mensaje += "\n"
+
+        if not found_any:
+            return mensaje + "No encontré fixtures en esas fechas/temporadas"
+
+        return mensaje
+
+    except Exception as e:
+        return f"Error debug_fixture ❌ {e}"
 
 def get_debug_squad_message():
     try:
@@ -435,7 +505,7 @@ def command_loop():
                 text = message.get("text", "")
 
                 if text == "/start":
-                    send_message("🤖 Bot conectado. Comandos: /ping /status /test_odds /test_football /liga /partidos /cuotas /value /stats /debug_squad")
+                    send_message("🤖 Bot conectado. Comandos: /ping /status /test_odds /test_football /liga /partidos /cuotas /value /stats /debug_fixture /debug_squad")
                 elif text == "/ping":
                     send_message("pong 🟢")
                 elif text == "/status":
@@ -473,6 +543,8 @@ def command_loop():
                     send_message(get_value_message())
                 elif text == "/stats":
                     send_message(stats_command())
+                elif text == "/debug_fixture":
+                    send_message(get_debug_fixture_message())
                 elif text == "/debug_squad":
                     send_message(get_debug_squad_message())
 
