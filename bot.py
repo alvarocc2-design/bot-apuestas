@@ -1,6 +1,7 @@
 import os
 import logging
-from telegram import Update
+import asyncio
+from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import anthropic
 
@@ -20,11 +21,11 @@ Tu trabajo es:
 3. Comparar con la probabilidad implícita de la cuota
 4. Determinar si hay VALUE (valor esperado positivo)
 
-FÓRMULA DE VALUE:
+FORMULA DE VALUE:
 - Probabilidad implícita de la cuota = 1 / cuota decimal
-- Value = (Probabilidad estimada × cuota) - 1
-- Si Value > 0 → HAY VALUE ✅
-- Si Value < 0 → NO HAY VALUE ❌
+- Value = (Probabilidad estimada x cuota) - 1
+- Si Value > 0 HAY VALUE
+- Si Value < 0 NO HAY VALUE
 
 MERCADOS QUE ANALIZAS:
 - Tarjetas amarillas
@@ -34,32 +35,30 @@ MERCADOS QUE ANALIZAS:
 - Faltas recibidas
 
 FORMATO DE RESPUESTA:
----
-🏟️ ANÁLISIS DE VALUE BET
+ANALISIS DE VALUE BET
 
-👤 Jugador: [nombre]
-📊 Mercado: [mercado analizado]
-💰 Cuota: [cuota] → Prob. implícita: [X]%
+Jugador: [nombre]
+Mercado: [mercado analizado]
+Cuota: [cuota] Prob. implicita: [X]%
 
-📈 ESTADÍSTICAS ANALIZADAS:
-[resume las stats más relevantes]
+ESTADISTICAS ANALIZADAS:
+[resume las stats mas relevantes]
 
-🧠 ANÁLISIS:
-[2-3 líneas de razonamiento]
+ANALISIS:
+[2-3 lineas de razonamiento]
 
-🎯 PROBABILIDAD ESTIMADA: [X]%
-📐 VALUE CALCULADO: [resultado]
+PROBABILIDAD ESTIMADA: [X]%
+VALUE CALCULADO: [resultado]
 
-✅ HAY VALUE — Edge de +[X]% / ❌ SIN VALUE
-⭐ Confianza: [Alta/Media/Baja]
-💡 [Recomendación final]
----
+HAY VALUE Edge de +[X]% / SIN VALUE
+Confianza: [Alta/Media/Baja]
+[Recomendacion final]
 
-Sé directo y honesto. Si las estadísticas son insuficientes dilo claramente."""
+Se directo y honesto. Si las estadisticas son insuficientes dilo claramente."""
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚽ Bienvenido al Bot de Value Betting\n\n"
+        "Bienvenido al Bot de Value Betting\n\n"
         "Envíame las estadísticas de un jugador junto con la cuota y te diré si hay value.\n\n"
         "Usa /ayuda para ver el formato."
     )
@@ -74,7 +73,7 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- 7 amarillas en 18 partidos\n"
         "- 2.1 faltas cometidas por partido\n"
         "- Árbitro estricto hoy\n\n"
-        "Puedes pegar los datos directamente de ValueStats 📊"
+        "Puedes pegar los datos directamente de ValueStats"
     )
 
 async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -82,11 +81,11 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_message.startswith("/"):
         return
 
-    waiting_msg = await update.message.reply_text("🔍 Analizando con IA... ⏳")
+    waiting_msg = await update.message.reply_text("Analizando con IA... un momento")
 
     try:
         response = client.messages.create(
-            model="claude-opus-4-5",
+            model="claude-haiku-4-5-20251001",
             max_tokens=1000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_message}]
@@ -98,7 +97,7 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error: {e}")
         await waiting_msg.delete()
-        await update.message.reply_text("❌ Error al analizar. Intenta de nuevo.")
+        await update.message.reply_text(f"Error al analizar: {str(e)}")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
