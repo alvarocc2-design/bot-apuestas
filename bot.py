@@ -29,6 +29,10 @@ FORMULA DE VALUE:
 - Si Value > 0 → HAY VALUE
 - Si Value < 0 → NO HAY VALUE
 
+RANGO DE CUOTA PREFERIDO: 1.50 a 2.00
+Las apuestas dentro de este rango CON value positivo son las prioritarias.
+Las apuestas fuera de este rango con value positivo también se muestran pero marcadas como secundarias.
+
 ANALISIS DE TARJETAS AMARILLAS:
 Cuando tengas la foto del árbitro crúzala con las stats de cada jugador:
 - Faltas cometidas por partido del jugador x tarjetas por partido del árbitro
@@ -55,13 +59,17 @@ Cuando el usuario pida el análisis final:
 1. Cruza stats de cada jugador con sus cuotas disponibles
 2. Si hay foto de árbitro úsala para ajustar la probabilidad de tarjetas
 3. Calcula el value para cada combinación jugador + mercado
-4. Ordena por mayor value esperado
-5. Recomienda la mejor apuesta
+4. Clasifica en dos grupos:
+   PRIORITARIAS: cuota entre 1.50 y 2.00 CON value positivo
+   OTRAS CON VALUE: cuota fuera de ese rango pero con value positivo
+5. Ordena cada grupo por mayor value esperado
+6. Recomienda siempre del grupo prioritario si existe
 
 FORMATO DE RESPUESTA FINAL:
+
 ANALISIS COMPLETO DEL PARTIDO
 
-TOP APUESTAS POR VALUE:
+--- APUESTAS PRIORITARIAS (cuota 1.50-2.00 con value) ---
 
 1. Jugador: [nombre]
    Mercado: [mercado]
@@ -73,15 +81,24 @@ TOP APUESTAS POR VALUE:
    VALUE: +[X]%
    Confianza: [Alta/Media/Baja]
 
-2. [siguiente apuesta...]
+--- OTRAS CON VALUE (fuera de rango preferido) ---
+
+1. Jugador: [nombre]
+   Mercado: [mercado]
+   Cuota: [cuota]
+   VALUE: +[X]%
+   Confianza: [Alta/Media/Baja]
+
+--- SIN VALUE (informativo) ---
+[Lista breve de apuestas sin value para evitar]
 
 MEJOR APUESTA DEL PARTIDO:
 Jugador: [nombre]
 Mercado: [mercado]
 Cuota: [cuota]
-Razonamiento: [2 líneas incluyendo factor árbitro si aplica]
+Razonamiento: [2 líneas]
 
-Si faltan fotos para completar el análisis indícalo y pídeselas al usuario."""
+Si no hay apuestas prioritarias indícalo claramente y explica por qué."""
 
 user_images = {}
 
@@ -97,7 +114,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   cuotas faltas\n"
         "   arbitro\n\n"
         "2. Escribe: analiza\n\n"
-        "3. El bot cruzará todo y te dará la mejor apuesta\n\n"
+        "3. El bot te dará las mejores apuestas priorizando cuotas entre 1.50 y 2.00 con value positivo\n\n"
         "Usa /limpiar para borrar las fotos y empezar de nuevo."
     )
 
@@ -111,7 +128,8 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Foto cuotas → caption: cuotas tarjetas\n"
         "Foto árbitro → caption: arbitro\n\n"
         "Paso 2 - Escribe: analiza\n\n"
-        "El bot recordará todas las fotos hasta que escribas /limpiar"
+        "El bot priorizará cuotas entre 1.50 y 2.00 con value positivo.\n"
+        "También mostrará otras apuestas con value fuera de ese rango."
     )
 
 async def limpiar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -188,7 +206,7 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         content.append({
             "type": "text",
-            "text": "Analiza todas las imágenes, cruza las estadísticas con las cuotas y dime cuál es la mejor apuesta del partido con el mayor value esperado."
+            "text": "Analiza todas las imágenes, cruza las estadísticas con las cuotas y dime cuál es la mejor apuesta del partido. Prioriza apuestas con cuota entre 1.50 y 2.00 que tengan value positivo."
         })
 
         response = client.messages.create(
