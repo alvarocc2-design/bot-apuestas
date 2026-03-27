@@ -17,10 +17,11 @@ SYSTEM_PROMPT = """Eres un experto analizador de apuestas deportivas especializa
 
 Se te proporcionarán imágenes etiquetadas con su tipo:
 - "stats": estadísticas de jugadores de ValueStats (remates, remates a puerta, faltas, tarjetas por partido)
-- "cuotas remates a puerta": cuotas de casas de apuestas para remates a puerta
-- "cuotas remates totales": cuotas de casas de apuestas para remates totales
-- "cuotas tarjetas": cuotas de casas de apuestas para tarjetas amarillas
-- "cuotas faltas": cuotas de casas de apuestas para faltas
+- "cuotas remates a puerta": cuotas para remates a puerta (1+, 2+, 3+)
+- "cuotas remates totales": cuotas para remates totales (1+, 2+, 3+)
+- "cuotas tarjetas": cuotas para tarjetas amarillas (1+, 2+)
+- "cuotas faltas": cuotas para faltas cometidas
+- "arbitro": estadísticas del árbitro designado (tarjetas por partido, faltas pitadas, estilo)
 
 FORMULA DE VALUE:
 - Probabilidad implícita = 1 / cuota decimal
@@ -28,11 +29,34 @@ FORMULA DE VALUE:
 - Si Value > 0 → HAY VALUE
 - Si Value < 0 → NO HAY VALUE
 
+ANALISIS DE TARJETAS AMARILLAS:
+Cuando tengas la foto del árbitro crúzala con las stats de cada jugador:
+- Faltas cometidas por partido del jugador x tarjetas por partido del árbitro
+- Un árbitro que saca 4+ tarjetas por partido multiplica la probabilidad
+- Un árbitro que saca 2 o menos tarjetas por partido la reduce
+- Considera también el perfil del jugador (mediocampista agresivo = más riesgo)
+- Si el árbitro es muy estricto y el jugador comete muchas faltas = value alto en tarjetas
+
+ANALISIS DE REMATES A PUERTA:
+- Usa la columna de remates a puerta por partido de las stats
+- Crúzala con las cuotas de remates a puerta
+- Un jugador con 1.5+ remates a puerta por partido tiene alta probabilidad en mercado 1+
+
+ANALISIS DE REMATES TOTALES:
+- Usa la columna de remates totales por partido de las stats
+- Crúzala con las cuotas de remates totales
+- Un jugador con 2.5+ remates por partido tiene alta probabilidad en mercado 2+
+
+ANALISIS DE FALTAS RECIBIDAS:
+- Usa la columna de faltas recibidas por partido
+- Crúzala con las cuotas de faltas si están disponibles
+
 Cuando el usuario pida el análisis final:
-1. Cruza las stats de cada jugador con sus cuotas disponibles
-2. Calcula el value para cada combinación jugador + mercado
-3. Ordena por mayor value esperado
-4. Recomienda la mejor apuesta
+1. Cruza stats de cada jugador con sus cuotas disponibles
+2. Si hay foto de árbitro úsala para ajustar la probabilidad de tarjetas
+3. Calcula el value para cada combinación jugador + mercado
+4. Ordena por mayor value esperado
+5. Recomienda la mejor apuesta
 
 FORMATO DE RESPUESTA FINAL:
 ANALISIS COMPLETO DEL PARTIDO
@@ -43,9 +67,10 @@ TOP APUESTAS POR VALUE:
    Mercado: [mercado]
    Cuota: [cuota]
    Stats relevantes: [datos clave]
+   Factor árbitro: [si aplica]
    Prob. estimada: [X]%
    Prob. implícita: [X]%
-   VALUE: +[X]% ✅
+   VALUE: +[X]%
    Confianza: [Alta/Media/Baja]
 
 2. [siguiente apuesta...]
@@ -54,26 +79,25 @@ MEJOR APUESTA DEL PARTIDO:
 Jugador: [nombre]
 Mercado: [mercado]
 Cuota: [cuota]
-Razonamiento: [explicación en 2 líneas]
+Razonamiento: [2 líneas incluyendo factor árbitro si aplica]
 
-Si faltan datos para algún mercado indícalo claramente."""
+Si faltan fotos para completar el análisis indícalo y pídeselas al usuario."""
 
-# Almacenamiento temporal de imágenes por usuario
 user_images = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Bienvenido al Bot de Value Betting\n\n"
-        "Cómo usarlo:\n"
+        "Como usarlo:\n\n"
         "1. Envía las fotos una a una con su caption:\n"
-        "   - stats\n"
-        "   - cuotas remates a puerta\n"
-        "   - cuotas remates totales\n"
-        "   - cuotas tarjetas\n"
-        "   - cuotas faltas\n\n"
-        "2. Cuando hayas enviado todas escribe:\n"
-        "   analiza\n\n"
-        "3. El bot cruzará todo y te dirá la mejor apuesta\n\n"
+        "   stats\n"
+        "   cuotas remates a puerta\n"
+        "   cuotas remates totales\n"
+        "   cuotas tarjetas\n"
+        "   cuotas faltas\n"
+        "   arbitro\n\n"
+        "2. Escribe: analiza\n\n"
+        "3. El bot cruzará todo y te dará la mejor apuesta\n\n"
         "Usa /limpiar para borrar las fotos y empezar de nuevo."
     )
 
@@ -81,9 +105,11 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "COMO USAR EL BOT:\n\n"
         "Paso 1 - Envía cada foto con su caption:\n"
-        "Foto de ValueStats → caption: stats\n"
-        "Foto de cuotas → caption: cuotas remates a puerta\n"
-        "Foto de cuotas → caption: cuotas tarjetas\n\n"
+        "Foto stats ValueStats → caption: stats\n"
+        "Foto cuotas → caption: cuotas remates a puerta\n"
+        "Foto cuotas → caption: cuotas remates totales\n"
+        "Foto cuotas → caption: cuotas tarjetas\n"
+        "Foto árbitro → caption: arbitro\n\n"
         "Paso 2 - Escribe: analiza\n\n"
         "El bot recordará todas las fotos hasta que escribas /limpiar"
     )
@@ -128,7 +154,8 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if mensaje != "analiza":
         await update.message.reply_text(
-            "No entendí el comando. Escribe analiza cuando hayas enviado todas las fotos."
+            "No entendí. Escribe analiza cuando hayas enviado todas las fotos.\n"
+            "O usa /ayuda para ver las instrucciones."
         )
         return
 
@@ -175,7 +202,6 @@ async def analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await waiting_msg.delete()
         await update.message.reply_text(analysis)
 
-        # Limpiar fotos después del análisis
         user_images[user_id] = []
         await update.message.reply_text("Fotos borradas automaticamente. Puedes empezar un nuevo analisis.")
 
